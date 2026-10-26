@@ -1,0 +1,46 @@
+[project]
+name = "sf-ingest"
+version = "0.1.0"
+description = "Nightly Salesforce ingestion into Unity Catalog SCD2 tables, deployed as a Databricks Asset Bundle"
+readme = "README.md"
+# Databricks Runtime 18 LTS (Spark 4.1.0) ships Python 3.12.
+requires-python = ">=3.12,<3.13"
+# Capped below the next major version: the job cluster resolves these from PyPI at every start, so an uncapped
+# major release could break the nightly run without any change here. Raise a cap after testing the new major.
+dependencies = [
+    "simple-salesforce>=1.12.6,<2",
+    "requests>=2.31,<3",
+    "cryptography>=42,<51",
+    "pyyaml>=6,<7",
+]
+
+[project.scripts]
+sf_ingest = "sf_ingest.tasks:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "responses>=0.25,<1",
+    # Local tests only: the cluster brings its own Spark and Delta. Match the runtime's Spark 4.1.
+    "pyspark>=4.1,<4.2",
+    "delta-spark>=4.3,<4.4",
+    "ruff>=0.6,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sf_ingest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["spark: needs a local Spark session with Delta (Java 17)"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

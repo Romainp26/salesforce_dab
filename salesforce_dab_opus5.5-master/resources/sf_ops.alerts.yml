@@ -1,0 +1,49 @@
+# Databricks SQL alerts on the warning checks (design: Data quality checks, Alerting).
+# Critical checks fail the job instead, which notifies through the job's on_failure emails.
+resources:
+  alerts:
+    sf_dq_warnings_roojai:
+      display_name: "Salesforce roojai_th_${bundle.target}: data quality warnings"
+      warehouse_id: ${var.warehouse_id}
+      query_text: |
+        SELECT count(*) AS failures
+        FROM roojai_th_${bundle.target}.ops_salesforce.dq_results
+        WHERE NOT passed
+          AND severity = 'warning'
+          AND check_name NOT IN ('new_field_auto_added', 'new_field_pending_approval')
+          AND checked_at >= current_timestamp() - INTERVAL 24 HOURS
+      evaluation:
+        source:
+          name: failures
+        comparison_operator: GREATER_THAN
+        threshold:
+          value:
+            double_value: 0
+        notification:
+          subscriptions:
+            - user_email: ${var.alert_email}
+      schedule:
+        quartz_cron_schedule: "0 0 7 * * ?"
+        timezone_id: Asia/Bangkok
+
+    sf_new_fields_digest_roojai:
+      display_name: "Salesforce roojai_th_${bundle.target}: new fields digest"
+      warehouse_id: ${var.warehouse_id}
+      query_text: |
+        SELECT count(*) AS new_fields
+        FROM roojai_th_${bundle.target}.ops_salesforce.dq_results
+        WHERE check_name IN ('new_field_auto_added', 'new_field_pending_approval')
+          AND checked_at >= current_timestamp() - INTERVAL 24 HOURS
+      evaluation:
+        source:
+          name: new_fields
+        comparison_operator: GREATER_THAN
+        threshold:
+          value:
+            double_value: 0
+        notification:
+          subscriptions:
+            - user_email: ${var.data_owner_email}
+      schedule:
+        quartz_cron_schedule: "0 0 8 * * ?"
+        timezone_id: Asia/Bangkok

@@ -1,0 +1,108 @@
+# One nightly job per catalog (D-16). Only Roojai until phase 2 (D-22): Kumka is a copy of this job
+# with "roojai" replaced by "kumka".
+#
+# Every task runs on the same classic job cluster behind the NAT gateway (D-03, D-04). The ingest task runs
+# every object in parallel threads of one Spark session, longest first: per object it extracts, merges into
+# SCD2, checks hard deletes on full loads and deletes the object's landing files. A failed object doesn't
+# stop the others; the task fails at the end and the job alerts. Repairing the run re-runs the ingest task,
+# which skips the objects that already finished; failed ones re-extract from their last committed watermark.
+resources:
+  jobs:
+    sf_nightly_roojai:
+      name: sf-nightly-roojai_th_${bundle.target}
+      description: Salesforce Roojai -> roojai_th_${bundle.target} (extract, SCD2 merge, policy views)
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: "0 30 0 * * ?"
+        timezone_id: Asia/Bangkok
+        pause_status: ${var.schedule_pause_status}
+      email_notifications:
+        on_failure:
+          - ${var.alert_email}
+      parameters:
+        - name: objects
+          # Comma-separated objects to run, empty for every configured object. Naming a paused object runs it.
+          default: ""
+        - name: full_reload
+          # Comma-separated objects to extract in full, e.g. "Account,Opportunity" (design: Recovery).
+          default: ""
+        - name: workers
+          # Objects at a time.
+          default: "${var.ingest_workers}"
+      job_clusters:
+        - job_cluster_key: sf
+          new_cluster: ${var.sf_cluster}
+
+      tasks:
+        - task_key: preflight
+          timeout_seconds: 3600
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [preflight, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
+                         --config-dir, "${workspace.file_path}/config"]
+          libraries:
+            - whl: ../dist/*.whl
+
+        - task_key: ingest
+          depends_on:
+            - task_key: preflight
+          timeout_seconds: ${var.long_task_timeout_seconds}
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [ingest, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
+                         --config-dir, "${workspace.file_path}/config",
+                         "--objects={{job.parameters.objects}}",
+                         "--full-reload={{job.parameters.full_reload}}",
+                         "--workers={{job.parameters.workers}}"]
+          libraries:
+            - whl: ../dist/*.whl
+
+        - task_key: views
+          depends_on:
+            - task_key: ingest
+          run_if: ALL_DONE
+          timeout_seconds: 3600
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [views, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
+                         --config-dir, "${workspace.file_path}/config"]
+          libraries:
+            - whl: ../dist/*.whl
+
+        - task_key: dq
+          depends_on:
+            - task_key: views
+          run_if: ALL_DONE
+          timeout_seconds: 3600
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [dq, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
+                         --config-dir, "${workspace.file_path}/config"]
+          libraries:
+            - whl: ../dist/*.whl
+
+        # Landing files can hold plaintext PII: always delete them, whatever happened before.
+        - task_key: cleanup
+          depends_on:
+            - task_key: preflight
+            - task_key: ingest
+            - task_key: views
+            - task_key: dq
+          run_if: ALL_DONE
+          timeout_seconds: 3600
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [cleanup, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
+                         --config-dir, "${workspace.file_path}/config"]
+          libraries:
+            - whl: ../dist/*.whl

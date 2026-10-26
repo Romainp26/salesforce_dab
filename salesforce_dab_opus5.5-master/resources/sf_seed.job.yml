@@ -1,0 +1,58 @@
+# One-off initial load from backup_salesforce, the manual deep clone of the Synapse tables (FR-04, B-14).
+# Run once per environment after the clone, before the first nightly run (docs/runbook.md §5.13). It refuses to
+# load into a non-empty SCD2 table.
+resources:
+  jobs:
+    sf_seed_roojai:
+      name: sf-seed-roojai_th_${bundle.target}
+      max_concurrent_runs: 1
+      email_notifications:
+        on_failure:
+          - ${var.alert_email}
+      parameters:
+        - name: objects
+          # Comma-separated objects; empty seeds every configured object that has a backup table.
+          default: ""
+      job_clusters:
+        - job_cluster_key: sf
+          new_cluster: ${var.sf_cluster}
+      tasks:
+        # Describes every object, so the SCD2 tables get today's Salesforce types.
+        - task_key: preflight
+          timeout_seconds: 3600
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [preflight, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
+                         --config-dir, "${workspace.file_path}/config"]
+          libraries:
+            - whl: ../dist/*.whl
+
+        - task_key: seed
+          depends_on:
+            - task_key: preflight
+          timeout_seconds: ${var.long_task_timeout_seconds}
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [seed, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
+                         --config-dir, "${workspace.file_path}/config", "--objects={{job.parameters.objects}}"]
+          libraries:
+            - whl: ../dist/*.whl
+
+        # Creates the views over the seeded tables.
+        - task_key: views
+          depends_on:
+            - task_key: seed
+          run_if: ALL_DONE
+          timeout_seconds: 3600
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [views, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
+                         --config-dir, "${workspace.file_path}/config"]
+          libraries:
+            - whl: ../dist/*.whl

@@ -1,0 +1,45 @@
+  - name: Account
+    encrypted_fields:
+      - Active_Phone_No__c
+      - Active_Email__c
+      - ACCOUNT_NAME__c
+      - PP_no_as_unique__c
+      - House_Number_Building_Number__c
+      - Thai_Identification_Number__c
+      - Contact_Individual_Passport_Number__c
+  - name: et4ae5__IndividualEmailResult__c
+    encrypted_fields: [et4ae5__Email__c]
+  - name: Contact
+    encrypted_fields: [Name]
+  - name: AWSConnectOutboundCallList__c
+    encrypted_fields: [PhoneNumber__c]
+  - name: Task
+    encrypted_fields: [PhoneNumber__c]
+  - name: Insured_Coverage__c
+    encrypted_fields: [FirstName__c]
+  - name: Insured_Person__c
+    encrypted_fields:
+      - TelNo__c
+      - MobileNo__c
+      - FirstName__c
+      - LastName__c
+      - House_Number_Building_Number__c
+      - Id_Card_Number__c
+      - Name
+  - name: Vehicle_Inspection_Data__c
+    encrypted_fields:
+      - Customer_contact_name__c
+      - Customer_phone_number__c
+      - Account_Email__c
+  - name: Claim__c
+    encrypted_fields:
+      - Account_Name__c
+      - Account_Name_Search__c
+      - Policy_Holder_Email__c
+  - name: Payments__c
+    encrypted_fields: [Account_Name__c]
+  - name: Opportunity
+    encrypted_fields:
+      - Mobile__c
+      - Mobile1__c
+      - Email_from_Account__c

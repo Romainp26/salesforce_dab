@@ -1,0 +1,10 @@
+# Run duration, rows per object and finish time over ops_salesforce.run_log (design: Alerting).
+resources:
+  dashboards:
+    sf_ops_roojai:
+      display_name: "Salesforce ingestion - roojai_th_${bundle.target}"
+      file_path: ../dashboards/sf_ops.lvdash.json
+      warehouse_id: ${var.warehouse_id}
+      # Queries in the JSON are unqualified; these point them at this target's catalog.
+      dataset_catalog: roojai_th_${bundle.target}
+      dataset_schema: ops_salesforce

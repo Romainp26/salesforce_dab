@@ -1,0 +1,385 @@
+{
+  "datasets": [
+    {
+      "name": "runs",
+      "displayName": "Runs",
+      "queryLines": [
+        "SELECT\n",
+        "  run_id,\n",
+        "  min(started_at) AS started_at,\n",
+        "  convert_timezone('Asia/Bangkok', max(ended_at)) AS finished_bangkok,\n",
+        "  round((unix_timestamp(max(ended_at)) - unix_timestamp(min(started_at))) / 60, 1) AS duration_minutes,\n",
+        "  count(*) AS objects,\n",
+        "  sum(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_objects,\n",
+        "  sum(rows_extracted) AS rows_extracted,\n",
+        "  sum(versions_written) AS versions_written\n",
+        "FROM run_log\n",
+        "WHERE last_stage <> 'backfill'\n",
+        "GROUP BY run_id\n"
+      ]
+    },
+    {
+      "name": "latest",
+      "displayName": "Latest run",
+      "queryLines": [
+        "SELECT object, status, rows_extracted, sf_count, versions_written, soft_deletes, archivals,\n",
+        "  hard_deletes, files_landed, watermark_before, watermark_after,\n",
+        "  round((unix_timestamp(ended_at) - unix_timestamp(started_at)) / 60, 1) AS minutes, error_message\n",
+        "FROM run_log\n",
+        "WHERE run_id = (SELECT max_by(run_id, started_at) FROM run_log WHERE last_stage <> 'backfill')\n"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "overview",
+      "displayName": "Overview",
+      "layout": [
+        {
+          "widget": {
+            "name": "finish_time",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "runs",
+                  "fields": [
+                    {
+                      "name": "started_at",
+                      "expression": "`started_at`"
+                    },
+                    {
+                      "name": "duration_minutes",
+                      "expression": "`duration_minutes`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "started_at",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Run start"
+                },
+                "y": {
+                  "fieldName": "duration_minutes",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Duration (minutes)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Nightly run duration"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "rows_per_object",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "latest",
+                  "fields": [
+                    {
+                      "name": "object",
+                      "expression": "`object`"
+                    },
+                    {
+                      "name": "rows_extracted",
+                      "expression": "`rows_extracted`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "object",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Object"
+                },
+                "y": {
+                  "fieldName": "rows_extracted",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Rows extracted"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Rows extracted per object, latest run"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 0,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "runs",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "runs",
+                  "fields": [
+                    {
+                      "name": "run_id",
+                      "expression": "`run_id`"
+                    },
+                    {
+                      "name": "started_at",
+                      "expression": "`started_at`"
+                    },
+                    {
+                      "name": "finished_bangkok",
+                      "expression": "`finished_bangkok`"
+                    },
+                    {
+                      "name": "duration_minutes",
+                      "expression": "`duration_minutes`"
+                    },
+                    {
+                      "name": "objects",
+                      "expression": "`objects`"
+                    },
+                    {
+                      "name": "failed_objects",
+                      "expression": "`failed_objects`"
+                    },
+                    {
+                      "name": "rows_extracted",
+                      "expression": "`rows_extracted`"
+                    },
+                    {
+                      "name": "versions_written",
+                      "expression": "`versions_written`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "run_id",
+                    "displayName": "run_id"
+                  },
+                  {
+                    "fieldName": "started_at",
+                    "displayName": "started_at"
+                  },
+                  {
+                    "fieldName": "finished_bangkok",
+                    "displayName": "finished_bangkok"
+                  },
+                  {
+                    "fieldName": "duration_minutes",
+                    "displayName": "duration_minutes"
+                  },
+                  {
+                    "fieldName": "objects",
+                    "displayName": "objects"
+                  },
+                  {
+                    "fieldName": "failed_objects",
+                    "displayName": "failed_objects"
+                  },
+                  {
+                    "fieldName": "rows_extracted",
+                    "displayName": "rows_extracted"
+                  },
+                  {
+                    "fieldName": "versions_written",
+                    "displayName": "versions_written"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Nightly runs"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "latest_run",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "latest",
+                  "fields": [
+                    {
+                      "name": "object",
+                      "expression": "`object`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "rows_extracted",
+                      "expression": "`rows_extracted`"
+                    },
+                    {
+                      "name": "sf_count",
+                      "expression": "`sf_count`"
+                    },
+                    {
+                      "name": "versions_written",
+                      "expression": "`versions_written`"
+                    },
+                    {
+                      "name": "soft_deletes",
+                      "expression": "`soft_deletes`"
+                    },
+                    {
+                      "name": "archivals",
+                      "expression": "`archivals`"
+                    },
+                    {
+                      "name": "hard_deletes",
+                      "expression": "`hard_deletes`"
+                    },
+                    {
+                      "name": "files_landed",
+                      "expression": "`files_landed`"
+                    },
+                    {
+                      "name": "watermark_before",
+                      "expression": "`watermark_before`"
+                    },
+                    {
+                      "name": "watermark_after",
+                      "expression": "`watermark_after`"
+                    },
+                    {
+                      "name": "minutes",
+                      "expression": "`minutes`"
+                    },
+                    {
+                      "name": "error_message",
+                      "expression": "`error_message`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "object",
+                    "displayName": "object"
+                  },
+                  {
+                    "fieldName": "status",
+                    "displayName": "status"
+                  },
+                  {
+                    "fieldName": "rows_extracted",
+                    "displayName": "rows_extracted"
+                  },
+                  {
+                    "fieldName": "sf_count",
+                    "displayName": "sf_count"
+                  },
+                  {
+                    "fieldName": "versions_written",
+                    "displayName": "versions_written"
+                  },
+                  {
+                    "fieldName": "soft_deletes",
+                    "displayName": "soft_deletes"
+                  },
+                  {
+                    "fieldName": "archivals",
+                    "displayName": "archivals"
+                  },
+                  {
+                    "fieldName": "hard_deletes",
+                    "displayName": "hard_deletes"
+                  },
+                  {
+                    "fieldName": "files_landed",
+                    "displayName": "files_landed"
+                  },
+                  {
+                    "fieldName": "watermark_before",
+                    "displayName": "watermark_before"
+                  },
+                  {
+                    "fieldName": "watermark_after",
+                    "displayName": "watermark_after"
+                  },
+                  {
+                    "fieldName": "minutes",
+                    "displayName": "minutes"
+                  },
+                  {
+                    "fieldName": "error_message",
+                    "displayName": "error_message"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Latest run per object (watermarks in UTC)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 12,
+            "width": 6,
+            "height": 10
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,93 @@
+# Salesforce ingestion bundle (design: Orchestration, environments and deployment).
+# Values marked TODO must be filled in before the first deploy.
+bundle:
+  name: salesforce_ingest
+
+include:
+  - resources/*.yml
+
+artifacts:
+  sf_ingest:
+    type: whl
+    build: uv build --wheel
+    path: .
+
+sync:
+  exclude:
+    - shared_folder/**
+    - tests/**
+    - scripts/**
+
+variables:
+  service_principal_app_id:
+    description: Application ID of the environment's service principal; the jobs run as it
+  cluster_policy_id:
+    description: Cluster policy that pins local disk encryption and dedicated access mode
+  alert_email:
+    description: On-call address for job failures and warning alerts
+    default: TODO-data-oncall@roojai.com
+  data_owner_email:
+    description: Receives the daily digest of new Salesforce fields
+    default: TODO-data-owner@roojai.com
+  warehouse_id:
+    description: SQL warehouse for the ops alerts and dashboard
+  schedule_pause_status:
+    description: UNPAUSED or PAUSED for the nightly and weekly schedules
+    default: UNPAUSED
+  ingest_workers:
+    description: Objects the ingest task runs at a time, in threads of one Spark session (mostly waiting on Salesforce)
+    default: 4
+  long_task_timeout_seconds:
+    description: >-
+      Timeout of the ingest, backfill and seed tasks. The other tasks get one hour. Timeouts are per task, not per
+      job, so the tasks after a timed-out one (views, dq, cleanup) still run and delete the landing files.
+    default: 21600
+  sf_cluster:
+    description: Classic job cluster shared by every task of a job (D-03, D-04)
+    type: complex
+    default:
+      # Databricks Runtime 18 LTS with Photon: Spark 4.1.0, Scala 2.13, Python 3.12.
+      spark_version: 18.x-photon-scala2.13
+      # Single node: 4 vCPU, 16 GB; the driver runs Spark locally on all cores.
+      node_type_id: Standard_D4ds_v5
+      num_workers: 0
+      custom_tags:
+        ResourceClass: SingleNode
+      policy_id: ${var.cluster_policy_id}
+      # Dedicated access mode as the service principal, local disk encryption for spill files.
+      data_security_mode: SINGLE_USER
+      single_user_name: ${var.service_principal_app_id}
+      enable_local_disk_encryption: true
+      spark_conf:
+        spark.databricks.cluster.profile: singleNode
+        spark.master: "local[*, 4]"
+        spark.sql.session.timeZone: UTC
+        # Ciphertext is base64 without line breaks (pii.base64_line_breaks); tasks.main pins it too.
+        spark.sql.chunkBase64String.enabled: "false"
+        # Each ingest worker thread submits to its own pool, so one object's big MERGE can't hold the cluster.
+        spark.scheduler.mode: FAIR
+
+workspace:
+  # UAT and PROD share one workspace (NFR-06).
+  host: https://adb-TODO.azuredatabricks.net
+  root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+
+targets:
+  uat:
+    mode: production
+    default: true
+    run_as:
+      service_principal_name: ${var.service_principal_app_id}
+    variables:
+      service_principal_app_id: TODO-sp-sf-ingest-uat-application-id
+      cluster_policy_id: TODO-uat-policy-id
+      warehouse_id: TODO-warehouse-id
+
+  prod:
+    mode: production
+    run_as:
+      service_principal_name: ${var.service_principal_app_id}
+    variables:
+      service_principal_app_id: TODO-sp-sf-ingest-prod-application-id
+      cluster_policy_id: TODO-prod-policy-id
+      warehouse_id: TODO-warehouse-id

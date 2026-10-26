@@ -1,0 +1,78 @@
+# Entities, orgs and secrets. Values marked TODO must be filled in before the first deploy.
+# The catalog is derived as <entity>_<country>_<env> (D-10), e.g. roojai_th_prod.
+
+# Salesforce REST/Bulk API version used for every call.
+api_version: "67.0"
+
+# Records per Bulk API 2.0 result page; each page becomes one landing file.
+bulk_page_size: 100000
+
+# Start of the CreatedDate ranges used to split an on-demand full reload of
+# objects with `split_full_reload: true` (one range per year, run in parallel).
+full_reload_split_from: "2012-01-01"
+
+# PII encryption (D-07, B-13). Roojai and Kumka share one key and IV.
+# Stored value: base64 (no line breaks) of Spark's aes_encrypt CBC output, which starts with the 16-byte IV.
+# The key is 32 random bytes and the IV 16 random bytes, both stored base64 in the environment's secret scope:
+#   python -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"   # key
+#   python -c "import os, base64; print(base64.b64encode(os.urandom(16)).decode())"   # IV
+pii:
+  key_version: 1
+  key_encoding: base64  # base64 | hex | utf8
+  iv_encoding: base64  # base64 | hex | utf8
+  iv_prefixed: true
+  # Spark's base64() can put CRLF every 76 characters (spark.sql.chunkBase64String.enabled); pinned off.
+  base64_line_breaks: false
+  aes_key_secret: sf-pii-aes-key
+  aes_iv_secret: sf-pii-aes-iv
+  # The key that encrypted the backup_salesforce data (Synapse, salesforce_dab): the seed decrypts with it and
+  # re-encrypts with the key above. Remove once every environment is seeded.
+  legacy:
+    secret_scope: TH-BI-databricks-kv  # TODO confirm; defaults to the environment's scope when omitted
+    key_encoding: utf8
+    iv_encoding: hex
+    aes_key_secret: sf-encryption-key
+    aes_iv_secret: sf-encryption-iv
+
+# One secret scope (Key Vault backed) per environment.
+environments:
+  uat:
+    secret_scope: sf-ingest-uat  # TODO
+  prod:
+    secret_scope: sf-ingest-prod  # TODO
+
+entities:
+  roojai:
+    country: th
+    # D-23: records deleted by these users are archived, not soft-deleted.
+    archival_user_ids: ["0052r0000018PjjAAE", "00528000001b87GAAQ"]
+    secrets:
+      consumer_key: roojai-sf-consumer-key
+      # PEM private key (optionally followed by its certificate) or a base64 PFX.
+      private_key: roojai-sf-jwt-key
+      # Only needed for a password-protected PFX; remove otherwise.
+      private_key_password: roojai-sf-jwt-key-password
+    orgs:
+      # domain: "login", "test", or the My Domain prefix such as "roojai.my" / "roojai--uat.sandbox.my".
+      uat:
+        domain: test  # TODO
+        username: TODO-integration-user@roojai.com.uat
+      prod:
+        domain: login  # TODO
+        username: TODO-integration-user@roojai.com
+
+  # Phase 2 (D-22): fill in once Kumka's object and field lists exist.
+  kumka:
+    country: th
+    archival_user_ids: []  # TODO
+    secrets:
+      consumer_key: kumka-sf-consumer-key
+      private_key: kumka-sf-jwt-key
+      private_key_password: kumka-sf-jwt-key-password
+    orgs:
+      uat:
+        domain: test  # TODO
+        username: TODO-integration-user@kumka.com.uat
+      prod:
+        domain: login  # TODO
+        username: TODO-integration-user@kumka.com

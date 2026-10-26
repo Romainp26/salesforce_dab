@@ -1,0 +1,125 @@
+TableName,WatermarkColumnName,delete_policy,Include CreatedDate = TODAY,load_type,Specific condition,schema_evolution
+Account,SystemModstamp,0,0,incremental,,require approval
+Account_Claim__History,CreatedDate,0,0,incremental,,auto-add
+AccountFeed,SystemModstamp,0,0,incremental,,auto-add
+AccountHistory,CreatedDate,0,0,incremental,,auto-add
+Asset,SystemModstamp,0,0,incremental,,auto-add
+AssetHistory,CreatedDate,0,0,incremental,,auto-add
+AWSConnectOutboundCallList__c,SystemModstamp,0,0,incremental,,require approval
+AWSConnectOutboundCallList__History,CreatedDate,0,0,incremental,,auto-add
+AWSConnectQueueSetup__c,SystemModstamp,0,0,incremental,,auto-add
+Bank_Account__c,SystemModstamp,0,0,incremental,,auto-add
+Biz_V_Mapping__c,SystemModstamp,0,0,incremental,,auto-add
+Biz_V_Mapping__History,CreatedDate,0,0,incremental,,auto-add
+Campaign,SystemModstamp,0,0,incremental,,auto-add
+CampaignMember,SystemModstamp,0,0,incremental,,auto-add
+Car_Accessories_assets__c,SystemModstamp,1,0,incremental,,auto-add
+Car_Accessories_assets__History,CreatedDate,0,0,incremental,,auto-add
+Car_Rental_Booking_Detail__c,SystemModstamp,0,0,incremental,,auto-add
+Case,SystemModstamp,0,0,incremental,,auto-add
+CaseHistory,CreatedDate,0,0,incremental,,auto-add
+Claim__c,SystemModstamp,0,0,incremental,,require approval
+Claim__History,CreatedDate,0,0,incremental,,auto-add
+Claim_Service_Fee__c,SystemModstamp,0,0,incremental,,auto-add
+Claim_Service_Fee__History,CreatedDate,0,0,incremental,,auto-add
+Contact,SystemModstamp,0,0,incremental,"Id != ""8002r000000vRMSAA2""",require approval
+Contract,SystemModstamp,0,0,incremental,,auto-add
+ContractHistory,CreatedDate,0,0,incremental,,auto-add
+ContractStatus,SystemModstamp,0,0,incremental,,auto-add
+Country__c,SystemModstamp,0,0,incremental,,auto-add
+Customer_Apps_Data__c,SystemModstamp,0,0,incremental,,auto-add
+Customer_Apps_Data__History,CreatedDate,0,0,incremental,,auto-add
+Damage__c,SystemModstamp,0,0,incremental,,auto-add
+Damage__History,CreatedDate,0,0,incremental,,auto-add
+Discount_Contract__c,SystemModstamp,0,0,incremental,,auto-add
+Discount_Contract__History,CreatedDate,0,0,incremental,,auto-add
+Disease_Classification__c,SystemModstamp,0,0,incremental,,auto-add
+Disease_Classification__History,CreatedDate,0,0,incremental,,auto-add
+Document_Generate_Queue__c,SystemModstamp,0,0,incremental,,auto-add
+Documents_Request__c,SystemModstamp,0,0,incremental,,auto-add
+Endorsement_reasons__c,SystemModstamp,0,0,incremental,,auto-add
+et4ae5__Automated_Send__c,SystemModstamp,0,0,incremental,,auto-add
+et4ae5__IndividualEmailResult__c,SystemModstamp,0,0,incremental,,require approval
+Financial_Movement_Details__c,SystemModstamp,0,0,incremental,,auto-add
+Fraud_Verification_Control__c,SystemModstamp,0,0,incremental,,auto-add
+GA_Commission_Setup__c,SystemModstamp,0,0,incremental,,auto-add
+GA_Commission_Setup__History,CreatedDate,0,0,incremental,,auto-add
+GA_Invoice_Header__c,SystemModstamp,1,0,incremental,,auto-add
+GA_Invoice_Split__c,SystemModstamp,0,0,incremental,,auto-add
+Garage__c,SystemModstamp,0,0,incremental,,auto-add
+Garage__History,CreatedDate,0,0,incremental,,auto-add
+Garage_Rating__c,SystemModstamp,0,0,incremental,,auto-add
+Group,SystemModstamp,0,0,incremental,,auto-add
+GroupMember,SystemModstamp,0,1,full,,auto-add
+Health__c,SystemModstamp,0,0,incremental,,auto-add
+Installment_Payment__c,SystemModstamp,0,0,incremental,,auto-add
+Insured_Coverage__c,SystemModstamp,0,0,incremental,,require approval
+Insured_Person__c,SystemModstamp,0,0,incremental,,require approval
+Lead,SystemModstamp,0,0,incremental,,auto-add
+Medical_Expenses__c,SystemModstamp,0,0,incremental,,auto-add
+Opportunity,SystemModstamp,0,0,incremental,,require approval
+OpportunityFieldHistory,CreatedDate,0,0,incremental,,auto-add
+OpportunityHistory,CreatedDate,0,0,incremental,,auto-add
+OpportunityLineItem,SystemModstamp,0,0,incremental,,auto-add
+Payment_Details__c,SystemModstamp,0,0,incremental,,auto-add
+Payment_Details__History,CreatedDate,0,0,incremental,,auto-add
+Payment_Option_Details__c,SystemModstamp,0,0,incremental,,auto-add
+Payments__c,SystemModstamp,1,0,incremental,,require approval
+Payments__History,CreatedDate,0,0,incremental,,auto-add
+Payments_Log__c,SystemModstamp,0,0,incremental,,auto-add
+Policy_Payment__c,SystemModstamp,0,0,incremental,,auto-add
+Policy_Payment__History,CreatedDate,0,0,incremental,,auto-add
+Postal_Code_Ref__c,SystemModstamp,0,0,incremental,,auto-add
+Pricebook2,SystemModstamp,0,0,incremental,,auto-add
+Pricebook2History,CreatedDate,0,0,incremental,,auto-add
+PricebookEntry,SystemModstamp,0,0,incremental,,auto-add
+ProcessDefinition,SystemModstamp,0,0,incremental,,auto-add
+ProcessInstance,SystemModstamp,0,0,incremental,,auto-add
+ProcessInstanceNode,SystemModstamp,0,0,incremental,,auto-add
+ProcessInstanceStep,SystemModstamp,0,0,incremental,,auto-add
+ProcessInstanceWorkitem,SystemModstamp,0,0,incremental,,auto-add
+ProcessNode,SystemModstamp,0,1,incremental,,auto-add
+Product2,SystemModstamp,0,0,incremental,,auto-add
+Product2Feed,SystemModstamp,0,0,incremental,,auto-add
+Product2History,CreatedDate,0,0,incremental,,auto-add
+ProductQuestion__c,SystemModstamp,0,0,incremental,,auto-add
+ProductQuestion__History,CreatedDate,0,0,incremental,,auto-add
+Profile,SystemModstamp,0,0,incremental,,auto-add
+Property__c,SystemModstamp,0,0,incremental,,auto-add
+QuestionResponse__c,SystemModstamp,1,0,incremental,,auto-add
+QuestionResponse__History,CreatedDate,0,0,incremental,,auto-add
+Quotation_Driver__c,SystemModstamp,1,0,incremental,,auto-add
+Quote,SystemModstamp,0,0,incremental,,auto-add
+QuoteHistory,CreatedDate,0,0,incremental,,auto-add
+QuoteLineItem,SystemModstamp,1,0,incremental,,auto-add
+Recovery_Details__c,SystemModstamp,0,0,incremental,,auto-add
+Recovery_Details__History,CreatedDate,0,0,incremental,,auto-add
+Recovery_Payment__c,SystemModstamp,0,0,incremental,,auto-add
+Recovery_Payment__History,CreatedDate,0,0,incremental,,auto-add
+RedBook__c,SystemModstamp,0,0,incremental,,auto-add
+RedBook__History,CreatedDate,0,0,incremental,,auto-add
+Related_Contact__c,SystemModstamp,0,0,incremental,,auto-add
+Related_Contact__History,CreatedDate,0,0,incremental,,auto-add
+Reported_Damages__c,SystemModstamp,0,0,incremental,,auto-add
+Reserve_Details__c,SystemModstamp,0,0,incremental,,auto-add
+Reserve_Details__History,CreatedDate,0,0,incremental,,auto-add
+Reserve_List__c,SystemModstamp,0,0,incremental,,auto-add
+Reserve_List__History,CreatedDate,0,0,incremental,,auto-add
+RJ_Reward_Points__c,SystemModstamp,0,0,incremental,,auto-add
+RJ_Reward_Points__History,CreatedDate,0,0,incremental,,auto-add
+SocialPost,SystemModstamp,0,0,incremental,,auto-add
+Surveyor_Case__c,SystemModstamp,0,0,incremental,,auto-add
+Surveyor_Session__c,SystemModstamp,0,0,incremental,,auto-add
+Task,SystemModstamp,0,0,incremental,,require approval
+TaskFeed,SystemModstamp,0,0,incremental,,auto-add
+TaskStatus,SystemModstamp,0,0,incremental,,auto-add
+Third_Party__c,SystemModstamp,1,0,incremental,,auto-add
+Travel__c,SystemModstamp,0,0,incremental,,auto-add
+User,SystemModstamp,0,1,full,,auto-add
+UserRole,SystemModstamp,0,1,incremental,,auto-add
+Vehicle_Inspection_Data__c,SystemModstamp,0,0,incremental,,require approval
+Vehicle_Inspection_Data__History,CreatedDate,0,0,incremental,,auto-add
+Voucher__c,SystemModstamp,0,0,incremental,,auto-add
+Voucher_points_mapping__c,SystemModstamp,0,0,incremental,,auto-add
+Workshop_Contract__c,SystemModstamp,0,0,incremental,,auto-add
+Workshop_Contract__History,CreatedDate,0,0,incremental,,auto-add

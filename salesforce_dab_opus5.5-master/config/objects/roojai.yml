@@ -1,0 +1,177 @@
+# Object configuration for roojai. Generated on 2026-10-26 by scripts/generate_config.py
+# from objects_allowlist_and_watermarks.csv and encrypted_fields.txt; edit by pull request from now on.
+# Keys: see ObjectConfig in src/sf_ingest/config.py. Objects list only what differs from defaults.
+defaults:
+  api: bulk
+  watermark: SystemModstamp
+  load_type: incremental
+  delete_policy: retain
+  include_created_today: false
+  new_fields: auto-add
+  hash_exclude: [SystemModstamp, LastViewedDate, LastReferencedDate]
+objects:
+- name: Account
+  new_fields: require-approval
+  encrypted_fields: [Active_Phone_No__c, Active_Email__c, ACCOUNT_NAME__c, PP_no_as_unique__c, House_Number_Building_Number__c,
+    Thai_Identification_Number__c, Contact_Individual_Passport_Number__c]
+  # Person-account names only; business accounts stay readable (design: PII encryption).
+  conditional_encryption:
+    columns: [Name, FirstName, LastName]
+    when: "Id <> '0012r00000Y6z0IAAR' AND (Type IS NULL OR lower(Type) IN ('customer', 'prospect'))"
+- {name: Account_Claim__History, watermark: CreatedDate}
+- {name: AccountFeed}
+- name: AccountHistory
+  watermark: CreatedDate
+  # Four of these fields are excluded from Account itself, so the history holds their only copy.
+  history_encryption:
+    fields: [PersonEmail, Phone, Thai_Identification_Number__c, Contact_Email_Address__c, PersonMobilePhone]
+- {name: Asset}
+- {name: AssetHistory, watermark: CreatedDate}
+- name: AWSConnectOutboundCallList__c
+  new_fields: require-approval
+  encrypted_fields: [PhoneNumber__c]
+- {name: AWSConnectOutboundCallList__History, watermark: CreatedDate}
+- {name: AWSConnectQueueSetup__c}
+- {name: Bank_Account__c}
+- {name: Biz_V_Mapping__c}
+- {name: Biz_V_Mapping__History, watermark: CreatedDate}
+- {name: Campaign}
+- {name: CampaignMember}
+- {name: Car_Accessories_assets__c, delete_policy: delete}
+- {name: Car_Accessories_assets__History, watermark: CreatedDate}
+- {name: Car_Rental_Booking_Detail__c}
+- {name: Case}
+- {name: CaseHistory, watermark: CreatedDate}
+- name: Claim__c
+  new_fields: require-approval
+  encrypted_fields: [Account_Name__c, Account_Name_Search__c, Policy_Holder_Email__c]
+- {name: Claim__History, watermark: CreatedDate}
+- {name: Claim_Service_Fee__c}
+- {name: Claim_Service_Fee__History, watermark: CreatedDate}
+- name: Contact
+  new_fields: require-approval
+  encrypted_fields: [Name]
+# 8002r000000vRMSAA2 is a corrupted Contract record: any query that returns it fails Salesforce-side, so it is
+# filtered in SOQL, never extracted. (The source CSV lists this condition under Contact; Id prefix 800 is Contract.)
+# Paused in UAT, as in salesforce_dab: the UAT org's Bulk query failed with "INVALID_DATE_FORMAT: Invalid DateTime",
+# possibly this same record. docs/uat-checklist.md tests whether the filter is enough to unpause it.
+- name: Contract
+  soql_filter: Id != '8002r000000vRMSAA2'
+  paused: [uat]
+- {name: ContractHistory, watermark: CreatedDate}
+- {name: ContractStatus, api: rest}
+- {name: Country__c}
+- {name: Customer_Apps_Data__c}
+- {name: Customer_Apps_Data__History, watermark: CreatedDate}
+- {name: Damage__c}
+- {name: Damage__History, watermark: CreatedDate}
+- {name: Discount_Contract__c}
+- {name: Discount_Contract__History, watermark: CreatedDate}
+- {name: Disease_Classification__c}
+- {name: Disease_Classification__History, watermark: CreatedDate}
+- {name: Document_Generate_Queue__c}
+- {name: Documents_Request__c}
+- {name: Endorsement_reasons__c}
+- {name: et4ae5__Automated_Send__c}
+- name: et4ae5__IndividualEmailResult__c
+  new_fields: require-approval
+  encrypted_fields: [et4ae5__Email__c]
+- {name: Financial_Movement_Details__c}
+- {name: Fraud_Verification_Control__c}
+- {name: GA_Commission_Setup__c}
+- {name: GA_Commission_Setup__History, watermark: CreatedDate}
+- {name: GA_Invoice_Header__c, delete_policy: delete}
+- {name: GA_Invoice_Split__c}
+- {name: Garage__c}
+- {name: Garage__History, watermark: CreatedDate}
+- {name: Garage_Rating__c}
+- {name: Group}
+- {name: GroupMember, load_type: full, include_created_today: true}
+- {name: Health__c}
+- {name: Installment_Payment__c}
+- name: Insured_Coverage__c
+  new_fields: require-approval
+  encrypted_fields: [FirstName__c]
+- name: Insured_Person__c
+  new_fields: require-approval
+  encrypted_fields: [TelNo__c, MobileNo__c, FirstName__c, LastName__c, House_Number_Building_Number__c, Id_Card_Number__c,
+    Name]
+- {name: Lead}
+- {name: Medical_Expenses__c}
+- name: Opportunity
+  new_fields: require-approval
+  encrypted_fields: [Mobile__c, Mobile1__c, Email_from_Account__c]
+- {name: OpportunityFieldHistory, watermark: CreatedDate}
+- {name: OpportunityHistory, watermark: CreatedDate}
+- {name: OpportunityLineItem}
+- {name: Payment_Details__c}
+- {name: Payment_Details__History, watermark: CreatedDate}
+- {name: Payment_Option_Details__c}
+# Paused in UAT: same INVALID_DATE_FORMAT failure as Contract.
+- name: Payments__c
+  paused: [uat]
+  delete_policy: delete
+  new_fields: require-approval
+  encrypted_fields: [Account_Name__c]
+- {name: Payments__History, watermark: CreatedDate}
+- {name: Payments_Log__c}
+- {name: Policy_Payment__c}
+- {name: Policy_Payment__History, watermark: CreatedDate}
+- {name: Postal_Code_Ref__c}
+- {name: Pricebook2}
+- {name: Pricebook2History, watermark: CreatedDate}
+- {name: PricebookEntry}
+- {name: ProcessDefinition}
+- {name: ProcessInstance}
+- {name: ProcessInstanceNode}
+- {name: ProcessInstanceStep}
+- {name: ProcessInstanceWorkitem}
+- {name: ProcessNode, include_created_today: true}
+- {name: Product2}
+- {name: Product2Feed}
+- {name: Product2History, watermark: CreatedDate}
+- {name: ProductQuestion__c}
+- {name: ProductQuestion__History, watermark: CreatedDate}
+- {name: Profile}
+- {name: Property__c}
+- {name: QuestionResponse__c, delete_policy: delete}
+- {name: QuestionResponse__History, watermark: CreatedDate}
+- {name: Quotation_Driver__c, delete_policy: delete}
+- {name: Quote}
+- {name: QuoteHistory, watermark: CreatedDate}
+- {name: QuoteLineItem, delete_policy: delete}
+- {name: Recovery_Details__c}
+- {name: Recovery_Details__History, watermark: CreatedDate}
+- {name: Recovery_Payment__c}
+- {name: Recovery_Payment__History, watermark: CreatedDate}
+- {name: RedBook__c}
+- {name: RedBook__History, watermark: CreatedDate}
+- {name: Related_Contact__c}
+- {name: Related_Contact__History, watermark: CreatedDate}
+- {name: Reported_Damages__c}
+- {name: Reserve_Details__c}
+- {name: Reserve_Details__History, watermark: CreatedDate}
+- {name: Reserve_List__c}
+- {name: Reserve_List__History, watermark: CreatedDate}
+- {name: RJ_Reward_Points__c}
+- {name: RJ_Reward_Points__History, watermark: CreatedDate}
+- {name: SocialPost}
+- {name: Surveyor_Case__c}
+- {name: Surveyor_Session__c}
+- name: Task
+  new_fields: require-approval
+  encrypted_fields: [PhoneNumber__c]
+- {name: TaskFeed}
+- {name: TaskStatus, api: rest}
+- {name: Third_Party__c, delete_policy: delete}
+- {name: Travel__c}
+- {name: User, load_type: full, include_created_today: true}
+- {name: UserRole, include_created_today: true}
+- name: Vehicle_Inspection_Data__c
+  new_fields: require-approval
+  encrypted_fields: [Customer_contact_name__c, Customer_phone_number__c, Account_Email__c]
+- {name: Vehicle_Inspection_Data__History, watermark: CreatedDate}
+- {name: Voucher__c}
+- {name: Voucher_points_mapping__c}
+- {name: Workshop_Contract__c}
+- {name: Workshop_Contract__History, watermark: CreatedDate}

@@ -14,15 +14,29 @@ from pyspark.sql import functions as F
 
 from . import ops
 from .config import SCD2_SCHEMA, ObjectConfig
-from .encrypt import CipherSpec, encrypt_columns, pii_keys, quote, reencrypt_statement
+from .encrypt import (
+    CipherSpec,
+    decrypt_change,
+    encrypt_change,
+    encrypt_columns,
+    key_column,
+    key_target,
+    pii_keys,
+    quote,
+    raw_text_sql,
+    rotate_change,
+)
 from .metadata import FieldInfo
 from .transform import (
+    BANGKOK_OFFSET_HOURS,
     bangkok_now,
     cast_from_string,
+    does_not_fit,
     normalize_empty,
     sf_datetime_to_bangkok,
     shift_history_values,
     spark_type,
+    type_change,
     uncastable_counts,
 )
 
@@ -36,6 +50,8 @@ SCD2_META = [
     ("_deleted_at", "TIMESTAMP_NTZ"),
     ("_is_archived", "BOOLEAN"),
     ("_archived_at", "TIMESTAMP_NTZ"),
+    # Missing from Salesforce altogether (a full load, or the hard-delete check of an incremental object, B-25).
+    ("_is_hard_deleted", "BOOLEAN"),
     ("_row_hash", "STRING"),
     ("_run_id", "STRING"),
     ("_extracted_at", "TIMESTAMP_NTZ"),
@@ -49,10 +65,15 @@ HISTORY_META = [
     ("_pii_key_version", "INT"),
 ]
 META_COLUMNS = {name for name, _ in SCD2_META}
-# The commit tag names the table: userMetadata is a session setting, so a MERGE that another object's thread
-# commits while it is set carries the tag too, and must not count as that object's re-encryption.
-REENCRYPT_TAG = "sf_ingest_reencrypt:{table}:{key}"
-_REENCRYPT_LOCK = threading.Lock()
+# The row hash covers the stored values (ciphertext for PII), never plaintext (B-21). Tables hashed the older way,
+# over plaintext, lack this property and are rehashed once.
+ROW_HASH_PROPERTY = "sf_ingest.row_hash"
+ROW_HASH_VERSION = "stored-v2"
+# The commit tag names the table, the change and its sequence number for that key: userMetadata is a session
+# setting, so a commit that another object's thread makes while it is set carries the tag too, and a key encrypted,
+# decrypted and encrypted again needs a new tag each time.
+MIGRATION_TAG = "sf_ingest_pii:{table}:{change}:{key}:{n}"
+_MIGRATION_LOCK = threading.Lock()
 
 
 def scd2_table(catalog: str, obj: ObjectConfig) -> str:
@@ -77,28 +98,97 @@ def table_exists(spark: SparkSession, table: str) -> bool:
     return spark.catalog.tableExists(table.replace("`", ""))
 
 
-def ensure_table(spark: SparkSession, table: str, columns: list[tuple[str, str]], meta) -> tuple[dict, bool]:
-    """Create the table, or add columns for new fields. Returns ({lower name: type}, created).
+def table_properties(obj: ObjectConfig) -> dict[str, str]:
+    props = {"delta.enableDeletionVectors": "true"}
+    if not obj.is_history:
+        props[ROW_HASH_PROPERTY] = ROW_HASH_VERSION
+    return props
 
-    A retyped field keeps its existing column type (preflight raises the warning); a removed field
-    stays as a column and is null from then on.
+
+def _properties_sql(props: dict[str, str]) -> str:
+    return ", ".join(f"'{k}' = '{v}'" for k, v in props.items())
+
+
+# Properties a rewrite doesn't carry over: they follow from the statement itself (features, protocol, clustering
+# columns) or are kept by Delta (row tracking's internal columns, the last commit's version and time).
+_DERIVED_PROPERTIES = (
+    "delta.feature.",
+    "delta.minReaderVersion",
+    "delta.minWriterVersion",
+    "delta.rowTracking.",
+    "delta.lastUpdateVersion",
+    "delta.lastCommitTimestamp",
+    "clusteringColumns",
+)
+
+
+def _carried_properties(props: dict[str, str]) -> dict[str, str]:
+    return {k: v for k, v in props.items() if not k.startswith(_DERIVED_PROPERTIES)}
+
+
+def _table_comment(spark: SparkSession, table: str) -> str | None:
+    rows = spark.sql(f"DESCRIBE TABLE EXTENDED {table}").collect()
+    return next((r.data_type for r in rows if r.col_name == "Comment" and r.data_type), None)
+
+
+def ensure_table(
+    spark: SparkSession, table: str, columns: list[tuple[str, str]], meta, properties: dict[str, str] | None = None
+) -> tuple[dict, bool]:
+    """Create the table, or add columns for new fields and new SCD2 columns. Returns ({lower name: type}, created).
+
+    A removed field stays as a column and is null from then on. A retyped field is widened or fails the object
+    (`evolve_types`).
     """
     created = False
     if not table_exists(spark, table):
         cols = ", ".join(f"{quote(n)} {t}" for n, t in [*columns, *meta])
-        spark.sql(
-            f"CREATE TABLE {table} ({cols}) USING DELTA CLUSTER BY (Id) "
-            "TBLPROPERTIES ('delta.enableDeletionVectors' = 'true')"
-        )
+        props = properties or {"delta.enableDeletionVectors": "true"}
+        spark.sql(f"CREATE TABLE {table} ({cols}) USING DELTA CLUSTER BY (Id) TBLPROPERTIES ({_properties_sql(props)})")
         created = True
     else:
         existing = {f.name.lower() for f in spark.table(table).schema.fields}
-        new = [(n, t) for n, t in columns if n.lower() not in existing]
+        new = [(n, t) for n, t in [*columns, *meta] if n.lower() not in existing]
         if new:
             log.info("%s: adding columns %s", table, [n for n, _ in new])
             spark.sql(f"ALTER TABLE {table} ADD COLUMNS ({', '.join(f'{quote(n)} {t}' for n, t in new)})")
-    types = {f.name.lower(): f.dataType.simpleString() for f in spark.table(table).schema.fields}
-    return types, created
+    return stored_types(spark, table), created
+
+
+def stored_types(spark: SparkSession, table: str) -> dict[str, str]:
+    return {f.name.lower(): f.dataType.simpleString() for f in spark.table(table).schema.fields}
+
+
+def evolve_types(spark: SparkSession, table: str, obj: ObjectConfig, fields: list[FieldInfo], business: list[str]):
+    """Fit tonight's columns to Salesforce's current types (B-32): widen a decimal or an integer with Delta type
+    widening, keep a type that already holds the values, and fail the object on any other change, which would
+    otherwise round, truncate or shift values silently. Returns the column types after the change."""
+    stored = stored_types(spark, table)
+    wanted = {n.lower(): t for n, t in column_types(obj, fields)}
+    widen, incompatible = [], []
+    for name in business:
+        if name.lower() not in wanted or name.lower() not in stored:
+            continue
+        change = type_change(stored[name.lower()], wanted[name.lower()])
+        if change == "widen":
+            widen.append((name, wanted[name.lower()]))
+        elif change == "incompatible":
+            incompatible.append(f"{name}: {stored[name.lower()]} -> {wanted[name.lower()]}")
+    if incompatible:
+        raise RuntimeError(
+            f"{obj.name}: Salesforce changed these fields' types and the stored values can't take the new ones "
+            f"losslessly: {incompatible}. Reset the object (runbook §5.9) or exclude the field"
+        )
+    if widen:
+        log.info("%s: widening %s", table, widen)
+        spark.sql(f"ALTER TABLE {table} SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')")
+        for name, new_type in widen:
+            spark.sql(f"ALTER TABLE {table} ALTER COLUMN {quote(name)} TYPE {new_type}")
+        stored = stored_types(spark, table)
+        if not obj.is_history and any(t.upper().startswith("DECIMAL") for _, t in widen):
+            # A wider scale writes 10.50 as 10.5000: rehash, or every record would look changed (B-32).
+            tracked = tracked_columns(obj, spark.table(table).columns)
+            spark.sql(f"UPDATE {table} SET _row_hash = {hash_sql(tracked)}")
+    return stored
 
 
 def read_landed(spark: SparkSession, path: Path | str) -> DataFrame:
@@ -128,11 +218,21 @@ def utc_watermark(col):
     return F.regexp_replace(col, r"(Z|\+0000)$", "").try_cast("timestamp_ntz")
 
 
-def row_hash(df: DataFrame, obj: ObjectConfig, business: list[str]) -> DataFrame:
-    """Hash of tracked plaintext fields, so re-encrypting a column never creates versions."""
-    excluded = {c.lower() for c in obj.hash_exclude}
-    tracked = sorted((c for c in business if c.lower() not in excluded), key=str.lower)
-    return df.withColumn("_row_hash", F.sha2(F.to_json(F.struct(*[F.col(c) for c in tracked])), 256))
+def tracked_columns(obj: ObjectConfig, columns: list[str]) -> list[str]:
+    """Business columns whose changes make a new version, in a fixed order."""
+    excluded = {c.lower() for c in obj.hash_exclude} | {c.lower() for c in META_COLUMNS}
+    return sorted((c for c in columns if c.lower() not in excluded), key=str.lower)
+
+
+def hash_sql(columns: list[str], overrides: dict[str, str] | None = None, prefix: str = "") -> str:
+    """SHA-256 over the stored values of `columns` (ciphertext for PII, typed values otherwise), as SQL (B-21).
+
+    `overrides` replaces a column's value by an expression, so a statement that rewrites a column also rehashes the
+    row from the new value. Nulls are left out of the JSON, so a column the extract doesn't return hashes as null.
+    """
+    overrides = {k.lower(): v for k, v in (overrides or {}).items()}
+    parts = ", ".join(f"'{c}', {overrides.get(c.lower(), prefix + quote(c))}" for c in columns)
+    return f"sha2(to_json(named_struct({parts})), 256)"
 
 
 def delete_flags(df: DataFrame, obj: ObjectConfig, archival_user_ids: tuple[str, ...]) -> DataFrame:
@@ -151,6 +251,7 @@ def delete_flags(df: DataFrame, obj: ObjectConfig, archival_user_ids: tuple[str,
         .withColumn("_is_deleted", deleted & ~F.col("_is_archived"))
         .withColumn("_deleted_at", F.when(F.col("_is_deleted"), F.col("_valid_from")))
         .withColumn("_archived_at", F.when(F.col("_is_archived"), F.col("_valid_from")))
+        .withColumn("_is_hard_deleted", F.lit(False))
     )
 
 
@@ -185,13 +286,21 @@ def merge_versions(spark: SparkSession, table: str, changes: DataFrame) -> None:
 
 
 def changed_rows(
-    spark: SparkSession, table: str, staged: DataFrame, full_load: bool = False, now_bangkok: datetime | None = None
+    spark: SparkSession,
+    table: str,
+    staged: DataFrame,
+    full_load: bool = False,
+    now_bangkok: datetime | None = None,
+    rewrite: bool = False,
 ) -> DataFrame:
     """New Ids, or a newer watermark with a different hash. Older or equal watermarks are replays (NFR-05).
 
-    On full-load objects a record flagged as hard-deleted (D-18) that is back in tonight's extract becomes current
-    again, even unchanged: the deleted version's `_valid_from` is the night it went missing, later than the record's
-    own watermark. The new version starts at its watermark if that is later, otherwise tonight.
+    Two cases also write a version starting tonight, even at an equal watermark:
+    - a record flagged as hard-deleted (a full load's absence, or the hard-delete check, B-25) that is back in
+      tonight's extract becomes current again, even unchanged;
+    - with `rewrite` (a corrective full reload, B-33), a record whose stored values differ from Salesforce's at the
+      same watermark (formula drift, a past bad load) gets a correction version.
+    The new version starts at its watermark if that is later, otherwise tonight.
     """
     current = (
         spark.table(table)
@@ -201,51 +310,279 @@ def changed_rows(
             F.col("_valid_from").alias("__cur_from"),
             F.col("_row_hash").alias("__cur_hash"),
             F.col("_is_deleted").alias("__cur_deleted"),
+            F.coalesce(F.col("_is_hard_deleted"), F.lit(False)).alias("__cur_hard"),
         )
     )
     joined = staged.join(current, staged["Id"] == current["__cur_id"], "left")
     newer = F.col("__cur_from").isNull() | (F.col("_valid_from") > F.col("__cur_from"))
-    keep = F.col("__cur_id").isNull() | (newer & ~F.col("_row_hash").eqNullSafe(F.col("__cur_hash")))
+    differs = ~F.col("_row_hash").eqNullSafe(F.col("__cur_hash"))
+    keep = F.col("__cur_id").isNull() | (newer & differs)
+    was_missing = F.col("__cur_hard")
     if full_load:
-        back = F.coalesce(F.col("__cur_deleted"), F.lit(False)) & ~F.col("_is_deleted")
-        keep = keep | back
-        tonight = F.expr(ntz_literal(now_bangkok or bangkok_now()))
-        joined = joined.withColumn("_valid_from", F.when(back & ~newer, tonight).otherwise(F.col("_valid_from")))
+        was_missing = was_missing | F.coalesce(F.col("__cur_deleted"), F.lit(False))
+    back = was_missing & ~F.col("_is_deleted")
+    corrected = F.col("__cur_id").isNotNull() & ~newer & differs if rewrite else F.lit(False)
+    keep = keep | back | corrected
+    tonight = F.expr(ntz_literal(now_bangkok or bangkok_now()))
+    joined = joined.withColumn(
+        "_valid_from", F.when((back | corrected) & ~newer, tonight).otherwise(F.col("_valid_from"))
+    )
     return (
         joined.where(keep)
         .withColumn("_has_current", F.col("__cur_id").isNotNull())
-        .drop("__cur_id", "__cur_from", "__cur_hash", "__cur_deleted")
+        .drop("__cur_id", "__cur_from", "__cur_hash", "__cur_deleted", "__cur_hard")
     )
 
 
-def apply_new_encryption(
-    spark: SparkSession, catalog: str, obj: ObjectConfig, table: str, spec: CipherSpec, key_version: int
-) -> list[str]:
-    """Encrypt existing values in every version for PII keys added to the config since the last run.
+# --------------------------------------------------------------------------------------------- PII policy changes
 
-    Each UPDATE is tagged in the Delta commit, so a crash before the state row is written never leads to
-    encrypting the same column twice.
+
+def _key_field(key: str) -> str:
+    """The field name a key protects, as decrypt_fields lists it."""
+    return key.removeprefix("history:").split("@")[0]
+
+
+def _ntz_from_text_sql(value_sql: str, target: str) -> str:
+    """SQL twin of transform.cast_from_string, for statements that retype a decrypted column."""
+    if target.upper() == "TIMESTAMP_NTZ":
+        naive = f"try_cast(regexp_replace({value_sql}, '(Z|\\\\+0000)$', '') AS TIMESTAMP_NTZ)"
+        return f"{naive} + INTERVAL {BANGKOK_OFFSET_HOURS} HOURS"
+    if target.upper() == "STRING":
+        return value_sql
+    return f"try_cast({value_sql} AS {target})"
+
+
+def check_key_version(spark: SparkSession, catalog: str, obj: ObjectConfig, key_version: int) -> None:
+    """Refuse to load under a new key while existing ciphertext still uses an older one: the rotate task re-encrypts
+    first (B-27). Mixed keys would break joins and give unchanged records a new version."""
+    rows = spark.table(ops.ops_table(catalog, "encryption_state")).where(F.col("object") == obj.name).collect()
+    latest: dict[str, tuple] = {}
+    for r in sorted(rows, key=lambda r: r.recorded_at):
+        latest[r.pii_key] = (r.action or "encrypted", r.key_version)
+    stale = sorted(k for k, (action, version) in latest.items() if action == "encrypted" and version != key_version)
+    if stale:
+        raise RuntimeError(
+            f"{obj.name}: {stale} are encrypted with an older key than pii.key_version {key_version}; "
+            "run the key rotation job first (runbook §5.12)"
+        )
+
+
+def _history_tags(spark: SparkSession, table: str) -> tuple[set[str], int]:
+    rows = spark.sql(f"DESCRIBE HISTORY {table}").select("version", "userMetadata").collect()
+    return {r.userMetadata for r in rows if r.userMetadata}, max(r.version for r in rows)
+
+
+def _tagged(spark: SparkSession, tag: str, statement: str) -> list:
+    """Run one rewrite with its commit tag and return its result rows. One at a time: the tag is a session-wide
+    setting shared by every thread."""
+    with _MIGRATION_LOCK:
+        spark.conf.set("spark.databricks.delta.commitInfo.userMetadata", tag)
+        try:
+            return spark.sql(statement).collect()
+        finally:
+            spark.conf.unset("spark.databricks.delta.commitInfo.userMetadata")
+
+
+def _replace_statement(
+    table: str,
+    obj: ObjectConfig,
+    schema: list[tuple[str, str]],
+    exprs: dict[str, str],
+    properties: dict[str, str],
+    comment: str | None = None,
+) -> str:
+    """CREATE OR REPLACE TABLE ... AS SELECT, for a change of a column's type. Unlike an UPDATE it leaves no
+    deletion-vector residue: the old files leave the table at once, and the purge task deletes them."""
+    exprs = {k.lower(): v for k, v in exprs.items()}
+    select = ", ".join(f"{exprs.get(n.lower(), quote(n))} AS {quote(n)}" for n, _ in schema)
+    described = f"COMMENT {ops.sql_string(comment)} " if comment else ""
+    return (
+        f"CREATE OR REPLACE TABLE {table} USING DELTA CLUSTER BY (Id) {described}"
+        f"TBLPROPERTIES ({_properties_sql(properties)}) AS SELECT {select} FROM {table}"
+    )
+
+
+def apply_pii_policy(
+    spark: SparkSession,
+    catalog: str,
+    obj: ObjectConfig,
+    table: str,
+    fields: list[FieldInfo],
+    spec: CipherSpec,
+    key_version: int,
+    run_id: str = "manual",
+) -> list[str]:
+    """Bring the stored values in line with the PII config, in every version (B-21, B-24). Returns the changes made.
+
+    - rehash a table still hashed over plaintext (B-21)
+    - decrypt keys removed from the config and listed in `decrypt_fields`; a removed key not listed fails the object
+    - encrypt keys added to the config, retyping a non-STRING column to STRING (B-24)
+
+    Each change is one tagged commit followed by a state row, so a crash in between never repeats it. The purge of
+    the history they leave behind (`tasks.purge`) is requested before the first one, so no crash can lose it.
+    A conditional key names its rule (`encrypt.rule_key`): a changed rule encrypts the rows it now covers.
     """
-    done = ops.encryption_state(spark, catalog, obj.name)
-    todo = [k for k in pii_keys(obj) if k not in done]
-    if not todo:
+    events = ops.encryption_events(spark, catalog, obj.name)
+    wanted = pii_keys(obj)
+    targets = {key_target(k) for k in wanted}
+    encrypted = {k for k, (action, _) in events.items() if action == "encrypted"}
+    to_encrypt = [k for k in wanted if k.lower() not in {e.lower() for e in encrypted}]
+    # A key is dropped when nothing in the config protects its column any more; an older rule's key is not.
+    dropped = sorted(k for k in encrypted if key_target(k) not in targets)
+    allowed = {f.lower() for f in obj.decrypt_fields}
+    if refused := [k for k in dropped if _key_field(k).lower() not in allowed]:
+        raise RuntimeError(
+            f"{obj.name}: {refused} hold ciphertext but are no longer in the PII config. List them in decrypt_fields "
+            "to decrypt their existing values (B-24), or put them back"
+        )
+    props = {r.key: r.value for r in spark.sql(f"SHOW TBLPROPERTIES {table}").collect()}
+    rehash = not obj.is_history and props.get(ROW_HASH_PROPERTY) != ROW_HASH_VERSION
+    if not (to_encrypt or dropped or rehash):
         return []
-    columns = {f.name.lower() for f in spark.table(table).schema.fields}
-    tags = {r.userMetadata for r in spark.sql(f"DESCRIBE HISTORY {table}").select("userMetadata").collect()}
-    for key in todo:
-        col = "oldvalue" if key.startswith("history:") else key.lower()
-        tag = REENCRYPT_TAG.format(table=obj.table, key=key)
-        if col in columns and tag not in tags:
-            log.info("%s: encrypting existing values of %s", obj.name, key)
-            # One re-encryption at a time: the commit tag is a session-wide setting shared by every thread.
-            with _REENCRYPT_LOCK:
-                spark.conf.set("spark.databricks.delta.commitInfo.userMetadata", tag)
-                try:
-                    spark.sql(reencrypt_statement(obj, table, key, spec))
-                finally:
-                    spark.conf.unset("spark.databricks.delta.commitInfo.userMetadata")
-        ops.record_encryption(spark, catalog, obj.name, [key], key_version)
-    return todo
+
+    tags, start_version = _history_tags(spark, table)
+    schema = [(f.name, f.dataType.simpleString()) for f in spark.table(table).schema.fields]
+    stored = {n.lower(): t for n, t in schema}
+    names = {n.lower(): n for n, _ in schema}
+    tracked = tracked_columns(obj, [n for n, _ in schema])
+    wanted_types = {f.name.lower(): spark_type(f) for f in fields}
+    planned = (["rehash"] if rehash else []) + [f"decrypt:{k}" for k in dropped] + [f"encrypt:{k}" for k in to_encrypt]
+    ops.request_purge(spark, catalog, obj.name, ", ".join(planned), start_version, run_id)
+    done: list[str] = []
+
+    def run(change: str, key: str, statement_for) -> None:
+        n = events.get(key, ("", 0))[1] + 1
+        tag = MIGRATION_TAG.format(table=obj.table, change=change, key=key, n=n)
+        if tag not in tags:
+            log.info("%s: %s %s in every version", obj.name, change, key)
+            _tagged(spark, tag, statement_for())
+
+    if rehash:
+        tag = MIGRATION_TAG.format(table=obj.table, change="rehash", key="_row_hash", n=1)
+        if tag not in tags:
+            log.info("%s: rehashing every version over stored values", obj.name)
+            _tagged(spark, tag, f"UPDATE {table} SET _row_hash = {hash_sql(tracked)}")
+        spark.sql(f"ALTER TABLE {table} SET TBLPROPERTIES ('{ROW_HASH_PROPERTY}' = '{ROW_HASH_VERSION}')")
+        done.append("rehash")
+
+    def statement(changes: dict[str, str], where: str, retype: dict[str, str]):
+        def build() -> str:
+            if retype:
+                # Columns change type: rewrite the table, keeping every row (B-24). A value the rule leaves alone
+                # keeps the text a nightly load would write: raw Salesforce text into STRING, a cast otherwise.
+                exprs = {}
+                for col, value in changes.items():
+                    target = retype.get(col.lower(), stored[col.lower()])
+                    q = quote(names[col.lower()])
+                    other = (
+                        raw_text_sql(q, stored[col.lower()])
+                        if target.upper() == "STRING"
+                        else _ntz_from_text_sql(q, target)
+                    )
+                    exprs[col] = f"CASE WHEN {where} THEN {value} ELSE {other} END"
+                if not obj.is_history:
+                    exprs["_row_hash"] = hash_sql(tracked, exprs)
+                exprs["_pii_key_version"] = f"CASE WHEN {where} THEN {key_version} ELSE _pii_key_version END"
+                return _replace_statement(
+                    table,
+                    obj,
+                    [(n, retype.get(n.lower(), t)) for n, t in schema],
+                    exprs,
+                    _carried_properties(props) | table_properties(obj),
+                    _table_comment(spark, table),
+                )
+            sets = [f"{quote(names[c.lower()])} = {v}" for c, v in changes.items()]
+            if not obj.is_history:
+                sets.append(f"_row_hash = {hash_sql(tracked, changes)}")
+            sets.append(f"_pii_key_version = {key_version}")
+            return f"UPDATE {table} SET {', '.join(sets)} WHERE {where}"
+
+        return build
+
+    for key in dropped:
+        col = key_column(key)
+        if col in stored:
+            changes, where = decrypt_change(key, spec)
+            target = wanted_types.get(col) if not key.startswith("history:") else None
+            retype = {col: target} if target and target.upper() != "STRING" and stored[col] == "string" else {}
+            if retype:
+                changes = {c: _ntz_from_text_sql(v, target) for c, v in changes.items()}
+            run("decrypt", key, statement(changes, where, retype))
+        ops.record_encryption(spark, catalog, obj.name, [key], key_version, "decrypted", run_id)
+        done.append(f"decrypt:{key}")
+
+    for key in to_encrypt:
+        col = key_column(key)
+        if col in stored:
+            changes, where = encrypt_change(obj, key, spec, stored[col])
+            retype = {} if stored[col] == "string" or key.startswith("history:") else {col: "STRING"}
+            run("encrypt", key, statement(changes, where, retype))
+        ops.record_encryption(spark, catalog, obj.name, [key], key_version, "encrypted", run_id)
+        done.append(f"encrypt:{key}")
+    return done
+
+
+def rotate_key(
+    spark: SparkSession,
+    catalog: str,
+    obj: ObjectConfig,
+    table: str,
+    previous: dict[int, CipherSpec],
+    spec: CipherSpec,
+    key_version: int,
+    run_id: str,
+) -> int:
+    """Re-encrypt every PII value still under an older key with the current one (B-27). Returns rows rewritten.
+
+    The keys come from ops_salesforce.encryption_state (what is encrypted), not the config: a key waiting to be
+    decrypted is rotated too, and one waiting to be encrypted is left to the nightly load, under the new key.
+    """
+    keys = ops.encryption_state(spark, catalog, obj.name)
+    if not keys:
+        return 0
+    columns = {c.lower() for c in spark.table(table).columns}
+    schema = [f.name for f in spark.table(table).schema.fields]
+    tracked = tracked_columns(obj, schema)
+    tags, start_version = _history_tags(spark, table)
+    versions = [r[0] for r in spark.table(table).select("_pii_key_version").distinct().collect() if r[0] is not None]
+    todo = sorted(v for v in versions if v != key_version)
+    if missing := [v for v in todo if v not in previous]:
+        raise RuntimeError(f"{obj.name}: rows use key versions {missing}, which pii.previous_keys doesn't list")
+    if todo:
+        # Before the rewrite, so a crash after it can't lose the purge of the old key's ciphertext.
+        ops.request_purge(spark, catalog, obj.name, f"rotate to key version {key_version}", start_version, run_id)
+    rewritten = 0
+    for version in todo:
+        changes = rotate_change(keys, columns, previous[version], spec)
+        sets = [f"{quote(c)} = {v}" for c, v in changes.items()]
+        if not obj.is_history:
+            sets.append(f"_row_hash = {hash_sql(tracked, changes)}")
+        sets.append(f"_pii_key_version = {key_version}")
+        tag = MIGRATION_TAG.format(table=obj.table, change="rotate", key=f"v{version}", n=key_version)
+        if tag not in tags:
+            log.info("%s: re-encrypting key version %s with version %s", obj.name, version, key_version)
+            rows = _tagged(spark, tag, f"UPDATE {table} SET {', '.join(sets)} WHERE _pii_key_version = {version}")
+            rewritten += int(rows[0]["num_affected_rows"]) if rows else 0
+    ops.record_encryption(spark, catalog, obj.name, sorted(keys), key_version, "encrypted", run_id)
+    return rewritten
+
+
+def prepare_existing(
+    spark: SparkSession,
+    catalog: str,
+    obj: ObjectConfig,
+    fields: list[FieldInfo],
+    spec: CipherSpec,
+    key_version: int,
+    run_id: str,
+) -> list[str]:
+    """What every run does to an existing table before loading, even with nothing extracted (B-21): check the key
+    version, then apply PII config changes."""
+    table = scd2_table(catalog, obj)
+    if not table_exists(spark, table):
+        return []
+    check_key_version(spark, catalog, obj, key_version)
+    return apply_pii_policy(spark, catalog, obj, table, fields, spec, key_version, run_id)
 
 
 @dataclass
@@ -255,6 +592,7 @@ class LoadStats:
     soft_deletes: int = 0
     archivals: int = 0
     watermark_utc: datetime | None = None
+    pii_changes: list[str] | None = None
 
 
 class UncastableValues(ValueError):
@@ -264,17 +602,15 @@ class UncastableValues(ValueError):
 def profile_landed(raw: DataFrame, obj: ObjectConfig, business: list[str], types: dict[str, str]) -> LoadStats:
     """Row count, UTC watermark and the cast check, in one pass over the landed pages.
 
-    A value that can't be cast would silently become null, so the object fails instead, before anything is merged.
+    A value that can't be cast, or that a decimal cast would round, would silently change, so the object fails
+    instead, before anything is merged.
     """
     targets = {c: types[c.lower()] for c in business if c.lower() in types}
     typed = [c for c, t in targets.items() if t.upper() != "STRING"]
     row = raw.agg(
         F.count("*").alias("__n"),
         F.max(utc_watermark(F.col(obj.watermark))).alias("__wm"),
-        *[
-            F.sum((F.col(c).isNotNull() & cast_from_string(F.col(c), targets[c]).isNull()).cast("int")).alias(c)
-            for c in typed
-        ],
+        *[F.sum(does_not_fit(F.col(c), targets[c]).cast("int")).alias(c) for c in typed],
     ).first()
     bad = {c: row[c] for c in typed if row[c]}
     if bad:
@@ -297,27 +633,33 @@ def load_object(
     key_version: int,
     run_id: str,
     now_bangkok: datetime | None = None,
+    rewrite: bool = False,
 ) -> LoadStats:
     table = scd2_table(catalog, obj)
     raw = read_landed(spark, path)
     business = [c for c in raw.columns if c not in ("_page_no", "_extracted_at")]
 
     meta = HISTORY_META if obj.is_history else SCD2_META
-    types, created = ensure_table(spark, table, column_types(obj, fields), meta)
-    stats = profile_landed(raw, obj, business, types)
-    staged = latest_per_id(raw, obj.watermark)
-
+    types, created = ensure_table(spark, table, column_types(obj, fields), meta, table_properties(obj))
+    pii_changes: list[str] = []
     if created:
         # A new table only ever receives encrypted values, so nothing needs re-encrypting.
-        ops.record_encryption(spark, catalog, obj.name, pii_keys(obj), key_version)
+        ops.record_encryption(spark, catalog, obj.name, pii_keys(obj), key_version, run_id=run_id)
     else:
-        apply_new_encryption(spark, catalog, obj, table, spec, key_version)
+        pii_changes = prepare_existing(spark, catalog, obj, fields, spec, key_version, run_id)
+        types = evolve_types(spark, table, obj, fields, business)
+    stats = profile_landed(raw, obj, business, types)
+    stats.pii_changes = pii_changes
+    staged = latest_per_id(raw, obj.watermark)
 
     if obj.is_history:
         staged = shift_history_values(staged)
     else:
-        staged = delete_flags(row_hash(staged, obj, business), obj, archival_user_ids)
+        staged = delete_flags(staged, obj, archival_user_ids)
     staged = cast_business(encrypt_columns(staged, obj, spec), business, types)
+    if not obj.is_history:
+        # Over the stored values, after encryption and casts: the hash reveals nothing the row doesn't (B-21).
+        staged = staged.withColumn("_row_hash", F.expr(hash_sql(tracked_columns(obj, business))))
     staged = staged.withColumn("_run_id", F.lit(run_id)).withColumn("_pii_key_version", F.lit(key_version))
 
     if obj.is_history:
@@ -336,7 +678,7 @@ def load_object(
         return stats
 
     staged = staged.withColumn("_is_current", F.lit(True)).withColumn("_valid_to", F.lit(None).cast("timestamp_ntz"))
-    changes = changed_rows(spark, table, staged, obj.load_type == "full", now_bangkok).localCheckpoint()
+    changes = changed_rows(spark, table, staged, obj.load_type == "full", now_bangkok, rewrite).localCheckpoint()
     agg = changes.agg(
         F.count("*").alias("n"),
         F.sum(F.col("_is_deleted").cast("int")).alias("deleted"),
@@ -359,13 +701,14 @@ def backfill_current(
     update: list[str],
     spec: CipherSpec,
     key_version: int,
+    plan: list[FieldInfo] | None = None,
+    run_id: str = "manual",
 ) -> int:
     """Fill `update` columns of the current versions from a `SELECT Id, ...` extract. Returns rows updated.
 
     For a field that was approved or auto-added after its records were last extracted. Closed versions keep null
     (their historical values are unknowable), the watermark doesn't move, and Ids absent from the table are skipped:
-    they arrive complete with the nightly load. `_row_hash` isn't recomputed, so a record's next change writes one
-    version even if only this field differs.
+    they arrive complete with the nightly load. `_row_hash` is recomputed from the new values.
     """
     table = scd2_table(catalog, obj)
     if not table_exists(spark, table):
@@ -374,9 +717,9 @@ def backfill_current(
     business = [c for c in raw.columns if c not in ("_page_no", "_extracted_at")]
     by_name = {f.name.lower(): f for f in fields}
     types, _ = ensure_table(spark, table, column_types(obj, [by_name[c.lower()] for c in business]), SCD2_META)
-    # Encrypt the existing values of newly listed PII columns first, as the nightly load does, so the backfilled
-    # ciphertext is never encrypted twice.
-    apply_new_encryption(spark, catalog, obj, table, spec, key_version)
+    # Apply PII config changes first, as the nightly load does, so the backfilled ciphertext is never encrypted twice.
+    prepare_existing(spark, catalog, obj, plan or fields, spec, key_version, run_id)
+    types = evolve_types(spark, table, obj, fields, business)
 
     bad = uncastable_counts(raw, {c: types[c.lower()] for c in business})
     if bad:
@@ -388,10 +731,12 @@ def backfill_current(
     staged = cast_business(encrypt_columns(staged, obj, spec), business, types).select("Id", *update)
     source = temp_view_name("backfill_source")
     staged.createOrReplaceTempView(source)
-    assignments = ", ".join(f"t.{quote(c)} = s.{quote(c)}" for c in update)
+    assignments = [f"t.{quote(c)} = s.{quote(c)}" for c in update]
+    tracked = tracked_columns(obj, spark.table(table).columns)
+    assignments.append(f"t._row_hash = {hash_sql(tracked, {c: f's.{quote(c)}' for c in update}, prefix='t.')}")
     metrics = spark.sql(
         f"MERGE INTO {table} t USING {source} s ON t.Id = s.Id AND t._is_current "
-        f"WHEN MATCHED THEN UPDATE SET {assignments}"
+        f"WHEN MATCHED THEN UPDATE SET {', '.join(assignments)}"
     ).first()
     updated = metrics.asDict().get("num_updated_rows") if metrics is not None else None
     return int(updated or 0)

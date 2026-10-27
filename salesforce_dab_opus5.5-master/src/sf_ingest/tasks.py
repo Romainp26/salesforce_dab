@@ -1,4 +1,4 @@
-"""Wheel entry point: `sf_ingest <task> --entity roojai --env uat --run-id ... --config-dir ...`.
+"""Wheel entry point: `sf_ingest <task> --entity roojai --env uat --run-id ...` (`--config-dir` for local runs).
 
 One subcommand per job task (design: Job tasks). Logs carry counts and IDs, never field values.
 """
@@ -9,26 +9,29 @@ import argparse
 import csv
 import json
 import logging
+import os
 import shutil
 import sys
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
 from . import dq, ops
 from .auth import SalesforceSession, load_key_material
-from .config import ObjectConfig, Settings, load_settings
-from .deletes import flag_hard_deletes
+from .config import BACKUP_SCHEMA, SCD2_SCHEMA, VIEW_SCHEMA, ObjectConfig, Settings, load_settings
+from .deletes import HardDeletes, flag_hard_deletes
 from .encrypt import CipherSpec, condition_fields, pin_base64_format
 from .extract import ExtractOutcome, extract_object, landing_dir, landing_root
 from .metadata import FieldInfo, describe_all, is_missing_object, plan_fields
-from .scd2 import LoadStats, backfill_current, load_object
-from .transform import bangkok_now
+from .scd2 import LoadStats, backfill_current, load_object, prepare_existing, rotate_key, scd2_table, table_exists
+from .transform import bangkok_now, bangkok_time
 from .views import refresh_views
 
 log = logging.getLogger("sf_ingest")
@@ -39,6 +42,25 @@ CERT_WARNING_DAYS = 30
 DEFAULT_WORKERS = 4
 # Landing folders of other runs older than this are leftovers of a run whose cleanup never ran.
 STALE_LANDING = timedelta(hours=12)
+# During a purge (B-21): a short file retention, so the next night's VACUUM deletes the files the rewrite and REORG
+# removed. Never 0: VACUUM would also delete files a concurrent writer hasn't committed yet, and no task runs longer
+# than 6 hours. A one-day log retention (Delta's granularity) and a checkpoint at every commit clean the log.
+PURGE_FILE_RETENTION = timedelta(hours=12)
+
+
+def purge_properties() -> dict[str, str]:
+    hours = int(PURGE_FILE_RETENTION.total_seconds() // 3600)
+    return {
+        "delta.deletedFileRetentionDuration": f"interval {hours} hours",
+        "delta.logRetentionDuration": "interval 1 days",
+        "delta.checkpointInterval": "1",
+    }
+
+
+# A purge whose log cleanup takes longer than this raises `pii_log_purged`.
+PURGE_LOG_WARNING = timedelta(days=4)
+# Where the wheel carries the deployed config (B-29): the jobs read it there, not from workspace files.
+PACKAGED_CONFIG = Path(__file__).parent / "_config"
 
 
 @dataclass
@@ -58,7 +80,13 @@ class Context:
     @property
     def spec(self) -> CipherSpec:
         t = self.settings.target
-        return CipherSpec.from_secret_scope(t.secret_scope, t.pii)
+        return CipherSpec.from_secret_scope(t.pii_secret_scope, t.pii)
+
+    @property
+    def previous_specs(self) -> dict[int, CipherSpec]:
+        """The keys a rotation replaced, by version (B-27)."""
+        t = self.settings.target
+        return {k.key_version: CipherSpec.previous(t.pii_secret_scope, k, t.pii) for k in t.pii.previous_keys}
 
     @property
     def legacy_spec(self) -> CipherSpec:
@@ -115,21 +143,51 @@ def seed_allowlist(ctx: Context) -> None:
 
 
 def apply_approvals(ctx: Context) -> None:
-    """Approved fields join the allowlist with allowed = 1, rejected ones with allowed = 0."""
-    approval = ops.ops_table(ctx.catalog, "field_approval")
+    """Decisions in config/approvals/<entity>.yml (B-28) set the allowlist: approved fields get allowed = 1, rejected
+    ones allowed = 0. The pending rows they answer in field_approval show the decision.
+
+    The decisions come from the deployed config, reviewed by pull request, so every environment applies the same
+    ones, and config validation has already refused an approved PII field that isn't encrypted.
+    """
+    if not ctx.settings.approvals:
+        return
+    rows = [
+        (a.object, a.field, 1 if a.decision == "approved" else 0, a.decision, a.decided_by)
+        for a in ctx.settings.approvals
+    ]
+    view = f"__sf_approvals_{ctx.run_id}".replace("-", "_")
+    schema = "object STRING, field STRING, allowed INT, decision STRING, decided_by STRING"
+    ctx.spark.createDataFrame(rows, schema).createOrReplaceTempView(view)
     ctx.spark.sql(
-        f"MERGE INTO {ops.ops_table(ctx.catalog, 'field_allowlist')} t "
-        f"USING (SELECT object, field, CASE status WHEN 'approved' THEN 1 ELSE 0 END AS allowed FROM {approval} "
-        "       WHERE status IN ('approved', 'rejected') AND applied_at IS NULL) s "
+        f"MERGE INTO {ops.ops_table(ctx.catalog, 'field_allowlist')} t USING {view} s "
         "ON lower(t.object) = lower(s.object) AND lower(t.field) = lower(s.field) "
-        "WHEN MATCHED THEN UPDATE SET allowed = s.allowed, source = 'approval', updated_at = current_timestamp() "
+        "WHEN MATCHED AND (t.allowed <> s.allowed OR t.source <> 'approval') THEN "
+        "UPDATE SET allowed = s.allowed, source = 'approval', updated_at = current_timestamp() "
         "WHEN NOT MATCHED THEN INSERT (object, field, allowed, source, updated_at) "
         "VALUES (s.object, s.field, s.allowed, 'approval', current_timestamp())"
     )
     ctx.spark.sql(
-        f"UPDATE {approval} SET applied_at = current_timestamp() "
-        "WHERE status IN ('approved', 'rejected') AND applied_at IS NULL"
+        f"MERGE INTO {ops.ops_table(ctx.catalog, 'field_approval')} t USING {view} s "
+        "ON lower(t.object) = lower(s.object) AND lower(t.field) = lower(s.field) AND t.status = 'pending' "
+        "WHEN MATCHED THEN UPDATE SET status = s.decision, decided_by = s.decided_by, "
+        "decided_at = current_timestamp(), applied_at = current_timestamp()"
     )
+
+
+def orphaned_objects(ctx: Context) -> list[dict]:
+    """Warnings for SCD2 tables and views of objects no longer in the config: their data is frozen (B-30)."""
+    configured = {o.table for o in ctx.settings.objects}
+    out = []
+    for schema in (SCD2_SCHEMA, VIEW_SCHEMA):
+        try:
+            tables = ctx.spark.catalog.listTables(f"{ctx.catalog}.{schema}")
+            names = [t.name for t in tables if not t.isTemporary]
+        except Exception:  # the schema doesn't exist yet
+            names = []
+        for name in sorted(n for n in names if n.lower() not in configured):
+            detail = f"{schema}.{name} is not in config/objects; add it with retired: true, or drop it"
+            out.append(dq.result("object_orphaned", name, dq.WARNING, False, detail))
+    return out
 
 
 def snapshot_object_config(ctx: Context) -> None:
@@ -157,25 +215,31 @@ def check_certificate(ctx: Context, not_after: datetime | None, subject: str | N
 def preflight(ctx: Context) -> None:
     spark, catalog = ctx.spark, ctx.catalog
     ops.ensure_ops_tables(spark, catalog)
-    results = [dq.result("setup", None, dq.WARNING, False, w) for w in ops.ensure_uc_objects(spark, catalog, ctx.spec)]
+    warnings = ops.ensure_uc_objects(spark, catalog, ctx.spec, ctx.settings.target.access, ctx.previous_specs)
+    results = [dq.result("setup", None, dq.WARNING, False, w) for w in warnings]
     seed_allowlist(ctx)
     snapshot_object_config(ctx)
     apply_approvals(ctx)
     run_plan = ops.ops_table(catalog, "run_plan")
     spark.sql(f"DELETE FROM {run_plan} WHERE created_at < current_timestamp() - INTERVAL 30 DAYS")
+    # A cancelled run never reached its cleanup task: its plaintext landing files go now, not a day later (B-34).
+    clean_landing(ctx, own=False)
+    results += orphaned_objects(ctx)
 
     session, not_after, subject = ctx.salesforce()
     results += check_certificate(ctx, not_after, subject)
 
-    objects = ctx.settings.objects
+    objects = tuple(o for o in ctx.settings.objects if not o.retired)
     described, describe_errors = describe_all(session.sf, [o.name for o in objects])
 
     allowlist: dict[str, dict[str, int]] = {}
     for r in spark.table(ops.ops_table(catalog, "field_allowlist")).collect():
         allowlist.setdefault(r.object.lower(), {})[r.field.lower()] = r.allowed
-    previous: dict[str, dict[str, str]] = {}
+    previous: dict[str, dict[str, FieldInfo]] = {}
     for r in spark.table(ops.ops_table(catalog, "object_schema")).collect():
-        previous.setdefault(r.object.lower(), {})[r.field.lower()] = r.sf_type
+        previous.setdefault(r.object.lower(), {})[r.field.lower()] = FieldInfo(
+            r.field, r.sf_type, r.length or 0, r.precision or 0, r.scale or 0
+        )
     pending = {
         (r.object.lower(), r.field.lower())
         for r in spark.table(ops.ops_table(catalog, "field_approval")).where("status = 'pending'").collect()
@@ -193,8 +257,13 @@ def preflight(ctx: Context) -> None:
                 obj, described[obj.name], allowlist.get(obj.name.lower(), {}), previous.get(obj.name.lower())
             )
         except Exception as exc:
-            if is_missing_object(exc):
-                status, error = "skipped", f"not in the {ctx.settings.target.env} org"
+            env = ctx.settings.target.env
+            if is_missing_object(exc) and (env in obj.paused or env != "prod"):
+                status, error = "skipped", f"not in the {env} org"
+            elif is_missing_object(exc):
+                # In PROD a 404 is also what a lost object permission looks like: fail, don't skip (B-23).
+                status = "failed"
+                error = f"not in the {env} org, or the integration user can't read it; pause it in {env} if expected"
             else:
                 status, error = "failed", f"{type(exc).__name__}: {exc}"[:2000]
             log.warning("%s: %s at preflight (%s); not ingested tonight", obj.name, status, error)
@@ -227,9 +296,20 @@ def preflight(ctx: Context) -> None:
                     {"object": obj.name, "field": f.name, "sf_type": f.sf_type, "status": "pending", "detected_at": now}
                 )
         for name in plan.removed:
-            log.warning("%s: field %s was removed in Salesforce; its column stays, null from now on", obj.name, name)
+            log.warning(
+                "%s: allowed field %s isn't in Salesforce's describe (removed, not deployed, or hidden by field-level "
+                "security); its column stays, null from now on",
+                obj.name,
+                name,
+            )
         for name, old, new in plan.retyped:
-            log.warning("%s: field %s changed type %s -> %s; its column keeps its type", obj.name, name, old, new)
+            log.warning(
+                "%s: field %s changed type %s -> %s; the load widens its column or fails the object (B-32)",
+                obj.name,
+                name,
+                old,
+                new,
+            )
         results += [dq.result("field_removed", obj.name, dq.WARNING, False, name) for name in plan.removed]
         results += [
             dq.result("field_retyped", obj.name, dq.WARNING, False, f"{name}: {old} -> {new}")
@@ -336,24 +416,42 @@ def extract(ctx: Context, obj: ObjectConfig, full: bool, watermark: datetime | N
     return outcome
 
 
-def load(ctx: Context, obj: ObjectConfig, extracted: ExtractOutcome, before: datetime | None) -> LoadStats | None:
-    """Merge the landed pages, then advance the watermark. Only ever called after a complete extract."""
+def load(
+    ctx: Context, obj: ObjectConfig, extracted: ExtractOutcome, before: datetime | None, rewrite: bool = False
+) -> LoadStats | None:
+    """Merge the landed pages, then advance the watermark. Only ever called after a complete extract.
+
+    With nothing extracted, PII config changes still apply to the existing table (B-21).
+    """
     path = landing_dir(landing_root(ctx.catalog), obj.name, ctx.run_id)
+    t = ctx.settings.target
     try:
+        fields = [FieldInfo(**f) for f in ops.read_run_plan(ctx.spark, ctx.catalog, ctx.run_id, obj.name)]
         if extracted.records:
-            fields = [FieldInfo(**f) for f in ops.read_run_plan(ctx.spark, ctx.catalog, ctx.run_id, obj.name)]
-            t = ctx.settings.target
             stats = load_object(
-                ctx.spark, ctx.catalog, obj, fields, path, t.archival_user_ids, ctx.spec, t.pii.key_version, ctx.run_id
+                ctx.spark,
+                ctx.catalog,
+                obj,
+                fields,
+                path,
+                t.archival_user_ids,
+                ctx.spec,
+                t.pii.key_version,
+                ctx.run_id,
+                now_bangkok=extract_start(extracted),
+                rewrite=rewrite,
             )
         else:
-            stats = None
+            changes = prepare_existing(ctx.spark, ctx.catalog, obj, fields, ctx.spec, t.pii.key_version, ctx.run_id)
+            stats = LoadStats(pii_changes=changes) if changes else None
     except Exception as exc:
         ops.append_event(
             ctx.spark, ctx.catalog, ctx.run_id, obj.name, "load", "failed", error_message=f"{type(exc).__name__}: {exc}"
         )
         raise
 
+    if stats and stats.pii_changes:
+        log.info("%s: PII config applied to every version: %s", obj.name, ", ".join(stats.pii_changes))
     after = before
     if stats and stats.watermark_utc:
         landed = stats.watermark_utc.replace(tzinfo=None)
@@ -377,6 +475,12 @@ def load(ctx: Context, obj: ObjectConfig, extracted: ExtractOutcome, before: dat
     return stats
 
 
+def extract_start(outcome: ExtractOutcome) -> datetime:
+    """When the extract began, in Bangkok time: versions written for tonight start there, not at the end of the load,
+    so a record changed while the run loads is newer and arrives with the next run."""
+    return bangkok_time(outcome.started_utc) if outcome.started_utc else bangkok_now()
+
+
 def check_hard_deletes(ctx: Context, obj: ObjectConfig, extracted: ExtractOutcome) -> int:
     """Full-load objects (User, GroupMember): flag records missing from tonight's complete extract (D-18).
 
@@ -384,9 +488,7 @@ def check_hard_deletes(ctx: Context, obj: ObjectConfig, extracted: ExtractOutcom
     """
     path = landing_dir(landing_root(ctx.catalog), obj.name, ctx.run_id)
     try:
-        if not extracted.records:
-            raise RuntimeError(f"{obj.name}: the full extract has no rows; hard deletes not checked")
-        n = flag_hard_deletes(ctx.spark, ctx.catalog, obj, path, ctx.run_id, bangkok_now())
+        n = flag_hard_deletes(ctx.spark, ctx.catalog, obj, path, ctx.run_id, extract_start(extracted)).flagged
     except Exception as exc:
         ops.append_event(
             ctx.spark,
@@ -402,17 +504,141 @@ def check_hard_deletes(ctx: Context, obj: ObjectConfig, extracted: ExtractOutcom
     return n
 
 
-def ingest_object(ctx: Context, obj: ObjectConfig, full: bool) -> ObjectResult:
-    """Extract, merge and (for full loads) check hard deletes, then delete the object's landing files."""
+def reconcile_due(ctx: Context, obj: ObjectConfig, last: datetime | None, now: datetime | None = None) -> bool:
+    """Whether tonight checks this incremental object for hard deletes (B-25): every `reconcile_days`, the first
+    check spread over that many nights by a hash of the name, so the objects don't all run the same night."""
+    days = ctx.settings.target.reconcile_days
+    if days <= 0 or obj.is_history or obj.load_type == "full":
+        return False
+    now = now or ops.now_utc()
+    if last is None:
+        return zlib.crc32(obj.name.encode()) % days == bangkok_now().date().toordinal() % days
+    # Half a day of slack: a night's run starts at about the same time, never exactly.
+    return now - last >= timedelta(days=days) - timedelta(hours=12)
+
+
+def reconcile(ctx: Context, obj: ObjectConfig) -> HardDeletes:
+    """Hard-delete check of an incremental object (B-25): an Id-only queryAll extract (recycle bin included), then
+    current records missing from it get a hard-deleted version, and flagged ones that are back are restored."""
+    path = landing_dir(landing_root(ctx.catalog), obj.name, ctx.run_id)
+    t = ctx.settings.target
+    try:
+        outcome = extract_object(
+            ctx.session(),
+            obj,
+            ["Id"],
+            path,
+            None,
+            True,
+            t.bulk_page_size,
+            date.fromisoformat(t.full_reload_split_from),
+            ops.now_utc(),
+        )
+        found = flag_hard_deletes(
+            ctx.spark,
+            ctx.catalog,
+            obj,
+            path,
+            ctx.run_id,
+            extract_start(outcome),
+            t.reconcile_max_deleted_share,
+            restore=True,
+        )
+    except Exception as exc:
+        ops.append_event(
+            ctx.spark,
+            ctx.catalog,
+            ctx.run_id,
+            obj.name,
+            "reconcile",
+            "failed",
+            error_message=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    ops.append_event(
+        ctx.spark,
+        ctx.catalog,
+        ctx.run_id,
+        obj.name,
+        "reconcile",
+        "succeeded",
+        hard_deletes=found.flagged,
+    )
+    log.info("%s: hard-delete check: %d flagged, %d restored", obj.name, found.flagged, found.restored)
+    return found
+
+
+def check_unseeded(ctx: Context, obj: ObjectConfig) -> None:
+    """A first load must not run before the seed (B-34): it would fill the table from Salesforce, and the seed would
+    then refuse it, losing the records only the Synapse backup holds (archived and purged ones)."""
+    from .seed import backup_table
+
+    backup = backup_table(ctx.catalog, obj)
+    table = scd2_table(ctx.catalog, obj)
+    if not table_exists(ctx.spark, backup) or ctx.spark.table(backup).isEmpty():
+        return
+    if table_exists(ctx.spark, table) and not ctx.spark.table(table).isEmpty():
+        return
+    # Ingested before, and dropped since to reload it (runbook §5.9, §5.11): not a first load.
+    events = ctx.spark.table(ops.ops_table(ctx.catalog, "run_events"))
+    ingested = (F.col("object") == obj.name) & (F.col("stage") == "ingest") & (F.col("status") == "succeeded")
+    if not events.where(ingested).isEmpty():
+        return
+    raise RuntimeError(
+        f"{obj.name}: {BACKUP_SCHEMA}.{obj.table} exists but hasn't been seeded. Run the seed job first "
+        "(runbook §5.13), or drop the backup table to load the object from Salesforce only"
+    )
+
+
+def apply_pii_config(ctx: Context, obj: ObjectConfig) -> str | None:
+    """A paused or retired object isn't loaded, but its stored values still follow the PII config (B-21): encrypt a
+    newly listed column, decrypt one in decrypt_fields. Field types come from tonight's plan, else the last
+    snapshot. Returns the error, recorded as a failed load event, if it fails."""
+    planned = obj.name in ops.planned_objects(ctx.spark, ctx.catalog, ctx.run_id)
+    fields = (
+        [FieldInfo(**f) for f in ops.read_run_plan(ctx.spark, ctx.catalog, ctx.run_id, obj.name)] if planned else []
+    )
+    if not fields:
+        snapshot = ctx.spark.table(ops.ops_table(ctx.catalog, "object_schema")).where(F.col("object") == obj.name)
+        fields = [
+            FieldInfo(r.field, r.sf_type, r.length or 0, r.precision or 0, r.scale or 0) for r in snapshot.collect()
+        ]
+    t = ctx.settings.target
+    try:
+        changes = prepare_existing(ctx.spark, ctx.catalog, obj, fields, ctx.spec, t.pii.key_version, ctx.run_id)
+    except Exception as exc:
+        log.exception("%s: applying the PII config failed", obj.name)
+        error = f"{type(exc).__name__}: {exc}"[:2000]
+        ops.append_event(ctx.spark, ctx.catalog, ctx.run_id, obj.name, "load", "failed", error_message=error)
+        return error
+    if changes:
+        log.info("%s: PII config applied to every version: %s", obj.name, ", ".join(changes))
+    return None
+
+
+def ingest_object(ctx: Context, obj: ObjectConfig, full: bool, rewrite: bool = False) -> ObjectResult:
+    """Extract, merge, check hard deletes (full loads nightly, incremental objects when due), then delete the
+    object's landing files."""
     started = time.monotonic()
     watermark = ops.get_watermark(ctx.spark, ctx.catalog, obj.name)
     before = watermark.replace(tzinfo=None) if watermark else None
-    if full or obj.load_type == "full":
+    full = full or rewrite
+    if rewrite:
+        mode = "full reload, correcting stored values"
+    elif full or obj.load_type == "full":
         mode = "full reload" if full else "full load"
     else:
         mode = f"changes since {before:%Y-%m-%d %H:%M:%S} UTC" if before else "first load, every record"
     log.info("%s: extracting (%s)", obj.name, mode)
     try:
+        if watermark is None:
+            try:
+                check_unseeded(ctx, obj)
+            except Exception as exc:
+                ops.append_event(
+                    ctx.spark, ctx.catalog, ctx.run_id, obj.name, "extract", "failed", error_message=str(exc)
+                )
+                raise
         extracted = extract(ctx, obj, full, watermark)
         log.info(
             "%s: extracted %d records in %d pages via %s%s",
@@ -424,8 +650,12 @@ def ingest_object(ctx: Context, obj: ObjectConfig, full: bool) -> ObjectResult:
         )
         if extracted.sf_count is not None and extracted.sf_count != extracted.records:
             log.warning("%s: extracted %d records but COUNT() says %d", obj.name, extracted.records, extracted.sf_count)
-        stats = load(ctx, obj, extracted, before)
+        stats = load(ctx, obj, extracted, before, rewrite)
         hard = check_hard_deletes(ctx, obj, extracted) if obj.load_type == "full" else None
+        if hard is None and reconcile_due(
+            ctx, obj, ops.last_succeeded(ctx.spark, ctx.catalog, "reconcile").get(obj.name)
+        ):
+            hard = reconcile(ctx, obj).flagged
     finally:
         shutil.rmtree(landing_dir(landing_root(ctx.catalog), obj.name, ctx.run_id), ignore_errors=True)
     ops.append_event(ctx.spark, ctx.catalog, ctx.run_id, obj.name, "ingest", "succeeded")
@@ -477,7 +707,13 @@ def _own_scheduler_pool(spark: SparkSession) -> None:
         pass
 
 
-def ingest(ctx: Context, requested: set[str], full_reload: set[str], workers: int = DEFAULT_WORKERS) -> None:
+def ingest(
+    ctx: Context,
+    requested: set[str],
+    full_reload: set[str],
+    workers: int = DEFAULT_WORKERS,
+    rewrite: set[str] = frozenset(),
+) -> None:
     """Every object of the run, `workers` at a time, longest first; fails at the end if any object failed.
 
     A repair of the same job run skips the objects that already finished in it.
@@ -494,13 +730,23 @@ def ingest(ctx: Context, requested: set[str], full_reload: set[str], workers: in
         if obj.name in done:
             log.info("%s: already ingested in this run; skipped by the repair", obj.name)
             continue
+        if obj.retired:
+            log.info("%s: retired (config/objects); skipped", obj.name)
+            if error := apply_pii_config(ctx, obj):
+                results.append(ObjectResult(obj.name, "failed", error=error))
+            continue
         if env in obj.paused:
             if obj.name not in requested:
                 log.info("%s: paused in %s (config/objects); skipped", obj.name, env)
+                error = apply_pii_config(ctx, obj)
                 ops.append_event(
                     ctx.spark, ctx.catalog, ctx.run_id, obj.name, "ingest", "skipped", error_message=f"paused in {env}"
                 )
-                results.append(ObjectResult(obj.name, "skipped", error=f"paused in {env}"))
+                results.append(
+                    ObjectResult(obj.name, "failed", error=error)
+                    if error
+                    else ObjectResult(obj.name, "skipped", error=f"paused in {env}")
+                )
                 continue
             log.warning("%s: paused in %s but requested in `objects`; running it", obj.name, env)
         if obj.name not in planned:
@@ -530,7 +776,7 @@ def ingest(ctx: Context, requested: set[str], full_reload: set[str], workers: in
         _own_scheduler_pool(ctx.spark)
         t0 = time.monotonic()
         try:
-            result = ingest_object(ctx, obj, obj.name in full_reload)
+            result = ingest_object(ctx, obj, obj.name in full_reload, obj.name in rewrite)
         except Exception as exc:
             log.exception("%s: failed", obj.name)
             result = ObjectResult(obj.name, "failed", time.monotonic() - t0, error=f"{type(exc).__name__}: {exc}")
@@ -585,8 +831,19 @@ def views(ctx: Context) -> None:
     refresh_views(ctx.spark, ctx.catalog, ctx.settings.objects)
 
 
-def quality(ctx: Context) -> None:
-    results = dq.run_checks(ctx.spark, ctx.catalog, ctx.run_id, ctx.settings.objects)
+def quality(ctx: Context, full: bool = False) -> None:
+    """The DQ checks. Table checks cover tonight's rows, and every row on Sundays (Bangkok), with `--dq-full`, and for
+    objects whose PII was rewritten in place tonight (B-37)."""
+    t = ctx.settings.target
+    full = full or bangkok_now().weekday() == 6
+    # Every object rewritten in place since its last purge, by this run or by a backfill or rotation since.
+    rewritten = {o for o, p in ops.pending_purges(ctx.spark, ctx.catalog).items() if p["state"] == "requested"}
+    log.info(
+        "Data quality checks over %s", "every row" if full else f"tonight's rows (every row of {sorted(rewritten)})"
+    )
+    results = dq.run_checks(
+        ctx.spark, ctx.catalog, ctx.run_id, ctx.settings.objects, t.env, full, t.freshness_hours, rewritten
+    )
     ops.append_dq(ctx.spark, ctx.catalog, ctx.run_id, results)
     critical = [r for r in results if r["severity"] == dq.CRITICAL and not r["passed"]]
     if critical:
@@ -596,27 +853,39 @@ def quality(ctx: Context) -> None:
         )
 
 
-def cleanup(ctx: Context) -> None:
-    """Delete this run's landing files, failed run or not: they can hold plaintext PII.
-
-    Folders of other runs are deleted too once they are older than STALE_LANDING (a run whose cleanup never ran);
-    younger ones belong to a job still running, such as a field backfill during the nightly run, and stay.
-    """
+def clean_landing(ctx: Context, own: bool = True) -> int:
+    """Delete this run's landing folders (`own`) and those of other runs older than STALE_LANDING (a run whose
+    cleanup never ran, e.g. a cancelled one). Younger folders belong to a job still running, such as a field backfill
+    during the nightly run, and stay. Returns how many stayed."""
     root = landing_root(ctx.catalog)
     cutoff = time.time() - STALE_LANDING.total_seconds()
     in_progress = 0
-    if root.exists():
-        for obj_dir in root.iterdir():
+    if not root.exists():
+        return 0
+    for obj_dir in root.iterdir():
+        # Another job cleans or lands alongside (a backfill during the nightly run): a folder may come or go.
+        try:
             if not obj_dir.is_dir():
                 obj_dir.unlink(missing_ok=True)
                 continue
             for run_dir in obj_dir.iterdir():
-                if run_dir.name == ctx.run_id or run_dir.stat().st_mtime < cutoff:
+                if (own and run_dir.name == ctx.run_id) or run_dir.stat().st_mtime < cutoff:
                     shutil.rmtree(run_dir, ignore_errors=True)
-                else:
+                elif run_dir.name != ctx.run_id:
                     in_progress += 1
             if not any(obj_dir.iterdir()):
                 obj_dir.rmdir()
+        except OSError as exc:
+            log.info("Landing folder %s changed while cleaning it (%s)", obj_dir.name, type(exc).__name__)
+    return in_progress
+
+
+def cleanup(ctx: Context) -> None:
+    """Delete this run's landing files, failed run or not: they can hold plaintext PII. Stale folders of other runs
+    go too (`clean_landing`)."""
+    root = landing_root(ctx.catalog)
+    cutoff = time.time() - STALE_LANDING.total_seconds()
+    in_progress = clean_landing(ctx)
     if in_progress:
         log.info("Left %d landing folders of other runs still in progress", in_progress)
     leftover = (
@@ -630,6 +899,144 @@ def cleanup(ctx: Context) -> None:
         ctx.run_id,
         [dq.result("landing_volume_empty", None, dq.WARNING, leftover == 0, f"{leftover} files left")],
     )
+
+
+# --------------------------------------------------------------------------------------------- purge and rotate
+
+
+def _table_version(spark, table: str) -> int:
+    return spark.sql(f"DESCRIBE HISTORY {table} LIMIT 1").first().version
+
+
+def _file_name(path: str) -> str:
+    return path.rstrip("/").rsplit("/", 1)[-1]
+
+
+def residue_files(spark, table: str, version: int | None) -> set[str]:
+    """Data files of an old version that the current version no longer uses: the ones holding the rewritten values.
+    Empty when the version is no longer readable from the log."""
+    if version is None:
+        return set()
+    try:
+        old = {_file_name(p) for p in spark.sql(f"SELECT * FROM {table} VERSION AS OF {version}").inputFiles()}
+    except Exception:
+        log.warning("%s: version %s no longer in the log; only the files recorded earlier are checked", table, version)
+        return set()
+    return old - {_file_name(p) for p in spark.table(table).inputFiles()}
+
+
+def purge_object(ctx: Context, obj: ObjectConfig, pending: dict) -> list[dict]:
+    """Remove the history an in-place PII rewrite left behind (B-21), over three or more nights:
+
+    1. `requested`: REORG ... APPLY (PURGE) rewrites the files whose rows a deletion vector only masks. The data
+       files of the version before the rewrite that the table no longer uses are recorded, and the table gets a
+       12-hour file retention, a one-day log retention and a checkpoint at every commit.
+    2. `reorged`, 12 hours later at least: VACUUM deletes the files no longer in the table. A VACUUM DRY RUN must then
+       list none of the recorded files (`pii_history_purged`, critical). Time travel can't read them any more.
+    3. `files_purged`: the log still holds per-file statistics (min/max values, possibly plaintext) of the old
+       files. The task commits once a night, so the checkpoint cleans the expired log, until the history starts
+       after the purge; then the default retentions come back.
+
+    Copies outside the table (storage soft delete, clones, backups) are outside Delta's reach (runbook §5.15).
+    """
+    spark, table = ctx.spark, scd2_table(ctx.catalog, obj)
+    if not table_exists(spark, table):
+        ops.record_purge(spark, ctx.catalog, obj.name, "done", None, ctx.run_id)
+        return []
+    if pending["state"] == "requested":
+        started = datetime.now()
+        before = pending["version"]
+        log.info("%s: purging the history before version %s (%s)", obj.name, before, "; ".join(pending["reasons"]))
+        spark.sql(f"REORG TABLE {table} APPLY (PURGE)")
+        files = sorted(residue_files(spark, table, before) | set(pending.get("files", ())))
+        props = ", ".join(f"'{k}' = '{v}'" for k, v in purge_properties().items())
+        spark.sql(f"ALTER TABLE {table} SET TBLPROPERTIES ({props})")
+        version = _table_version(spark, table)
+        ops.record_purge(spark, ctx.catalog, obj.name, "reorged", version, ctx.run_id, started, files)
+        log.info("%s: %d files to delete at the next purge, 12 hours from now at least", obj.name, len(files))
+        return []
+    if pending["state"] == "reorged":
+        if datetime.now() - pending["at"] < PURGE_FILE_RETENTION:
+            log.info("%s: REORG less than %s ago; VACUUM at the next purge", obj.name, PURGE_FILE_RETENTION)
+            return []
+        spark.sql(f"VACUUM {table}")
+        remaining = {_file_name(r[0]) for r in spark.sql(f"VACUUM {table} DRY RUN").collect()}
+        left = sorted(set(pending.get("files", ())) & remaining)
+        if not left:
+            ops.record_purge(spark, ctx.catalog, obj.name, "files_purged", _table_version(spark, table), ctx.run_id)
+        recorded = len(pending.get("files", ()))
+        detail = f"{len(left)} of {recorded} files of the old versions still in storage"
+        return [dq.result("pii_history_purged", obj.name, dq.CRITICAL, not left, detail)]
+    # files_purged: commit once, so the checkpoint written at this commit cleans the expired log.
+    spark.sql(f"ALTER TABLE {table} SET TBLPROPERTIES ('sf_ingest.purge_check' = {ops.sql_string(ctx.run_id)})")
+    earliest = spark.sql(f"DESCRIBE HISTORY {table}").agg({"version": "min"}).first()[0]
+    if earliest > pending["version"]:
+        spark.sql(
+            f"ALTER TABLE {table} UNSET TBLPROPERTIES IF EXISTS "
+            f"({', '.join(repr(k) for k in [*purge_properties(), 'sf_ingest.purge_check'])})"
+        )
+        ops.record_purge(spark, ctx.catalog, obj.name, "done", earliest, ctx.run_id)
+        return [dq.result("pii_log_purged", obj.name, dq.WARNING, True, f"log starts at version {earliest}")]
+    late = datetime.now() - pending["at"] > PURGE_LOG_WARNING
+    detail = f"log still starts at version {earliest}, before the purge at {pending['version']}"
+    return [dq.result("pii_log_purged", obj.name, dq.WARNING, not late, detail)]
+
+
+def purge(ctx: Context) -> None:
+    """Every pending purge (B-21). Fails the job when files of an old version stay in storage."""
+    pending = ops.pending_purges(ctx.spark, ctx.catalog)
+    by_name = {o.name: o for o in ctx.settings.objects}
+    results, failed = [], []
+    for name, state in sorted(pending.items()):
+        # An object removed from the config since its rewrite is still purged, by its table name.
+        obj = by_name.get(name) or ObjectConfig(name=name)
+        try:
+            results += purge_object(ctx, obj, state)
+        except Exception as exc:
+            log.exception("%s: purge failed", name)
+            results.append(dq.result("pii_history_purged", name, dq.CRITICAL, False, f"{type(exc).__name__}: {exc}"))
+            failed.append(name)
+    ops.append_dq(ctx.spark, ctx.catalog, ctx.run_id, results)
+    failed += [
+        r["object"] for r in results if r["severity"] == dq.CRITICAL and not r["passed"] and r["object"] not in failed
+    ]
+    log.info("Purge: %d pending, %d failed", len(pending), len(failed))
+    if failed:
+        raise RuntimeError(f"Purge failed for {sorted(failed)}: their old versions may still hold plaintext")
+
+
+def rotate(ctx: Context, requested: set[str] = frozenset()) -> None:
+    """Re-encrypt every PII value from the keys in pii.previous_keys to the current one (B-27, runbook §5.12), for
+    every object or the `requested` ones (a rerun of those that failed)."""
+    t = ctx.settings.target
+    previous = ctx.previous_specs
+    if not previous:
+        raise SystemExit("rotate: pii.previous_keys lists no key to rotate from")
+    failed = []
+    for obj in ctx.settings.objects:
+        if requested and obj.name not in requested:
+            continue
+        table = scd2_table(ctx.catalog, obj)
+        # Every object with encrypted values, as recorded, even one whose PII config was emptied since.
+        if not table_exists(ctx.spark, table) or not ops.encryption_state(ctx.spark, ctx.catalog, obj.name):
+            continue
+        try:
+            n = rotate_key(ctx.spark, ctx.catalog, obj, table, previous, ctx.spec, t.pii.key_version, ctx.run_id)
+            ops.append_event(ctx.spark, ctx.catalog, ctx.run_id, obj.name, "rotate", "succeeded", versions_written=n)
+        except Exception as exc:
+            log.exception("%s: rotation failed", obj.name)
+            ops.append_event(
+                ctx.spark,
+                ctx.catalog,
+                ctx.run_id,
+                obj.name,
+                "rotate",
+                "failed",
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
+            failed.append(obj.name)
+    if failed:
+        raise RuntimeError(f"Key rotation failed for {failed}")
 
 
 # --------------------------------------------------------------------------------------------- field backfill
@@ -703,6 +1110,8 @@ def backfill(ctx: Context, fields_arg: str) -> None:
                     update,
                     ctx.spec,
                     t.pii.key_version,
+                    list(plan.values()),
+                    ctx.run_id,
                 )
             ops.append_event(
                 ctx.spark,
@@ -736,7 +1145,7 @@ def backfill(ctx: Context, fields_arg: str) -> None:
 # --------------------------------------------------------------------------------------------- CLI
 
 
-TASKS = ["preflight", "ingest", "views", "dq", "cleanup", "seed", "backfill"]
+TASKS = ["preflight", "ingest", "views", "dq", "purge", "cleanup", "seed", "backfill", "rotate"]
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -744,10 +1153,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("task", choices=TASKS)
     p.add_argument("--entity", required=True)
     p.add_argument("--env", required=True)
-    p.add_argument("--config-dir", required=True, type=Path)
+    p.add_argument("--config-dir", type=Path, default=None, help="default: the config packaged in the wheel (B-29)")
     p.add_argument("--run-id", default="manual")
-    p.add_argument("--objects", default="", help="ingest, seed: comma-separated objects, empty for all")
+    p.add_argument("--objects", default="", help="ingest, seed, rotate: comma-separated objects, empty for all")
     p.add_argument("--full-reload", default="", help="ingest: comma-separated objects to extract in full")
+    p.add_argument(
+        "--rewrite", default="", help="ingest: objects to extract in full and correct where stored values differ"
+    )
+    p.add_argument("--dq-full", default="false", help="dq: true checks every row, not only tonight's")
     p.add_argument("--workers", default="", help=f"ingest: objects at a time, empty for {DEFAULT_WORKERS}")
     p.add_argument("--fields", default="", help="backfill: comma-separated Object.Field entries")
     return p.parse_args(argv)
@@ -773,25 +1186,42 @@ def main(argv: list[str] | None = None) -> None:
     spark = SparkSession.builder.getOrCreate()
     # Casting TIMESTAMP to TIMESTAMP_NTZ uses the session time zone; UTC keeps the +7h shift exact.
     spark.conf.set("spark.sql.session.timeZone", "UTC")
-    ctx = Context(load_settings(args.config_dir, args.entity, args.env), spark, args.run_id, args.config_dir)
+    if args.config_dir and os.environ.get("DATABRICKS_RUNTIME_VERSION"):
+        # Jobs run the reviewed config packaged in the wheel, never a workspace folder anyone could edit (B-29).
+        raise SystemExit("--config-dir is for local runs; jobs read the config packaged in the wheel")
+    config_dir = args.config_dir or PACKAGED_CONFIG
+    ctx = Context(load_settings(config_dir, args.entity, args.env), spark, args.run_id, config_dir)
     pin_base64_format(spark, ctx.settings.target.pii)
 
     configured = {o.name for o in ctx.settings.objects}
-    for flag, names in (("--objects", _csv_set(args.objects)), ("--full-reload", _csv_set(args.full_reload))):
+    flags = (
+        ("--objects", _csv_set(args.objects)),
+        ("--full-reload", _csv_set(args.full_reload)),
+        ("--rewrite", _csv_set(args.rewrite)),
+    )
+    for flag, names in flags:
         if unknown := names - configured:
             raise SystemExit(f"{flag} names unconfigured objects: {sorted(unknown)}")
+    if history := sorted(n for n in _csv_set(args.rewrite) if ctx.settings.object(n).is_history):
+        raise SystemExit(f"--rewrite: {history} are append-only *History objects")
 
     match args.task:
         case "preflight":
             preflight(ctx)
         case "ingest":
-            ingest(ctx, _csv_set(args.objects), _csv_set(args.full_reload), _workers(args.workers))
+            ingest(
+                ctx, _csv_set(args.objects), _csv_set(args.full_reload), _workers(args.workers), _csv_set(args.rewrite)
+            )
         case "views":
             views(ctx)
         case "dq":
-            quality(ctx)
+            quality(ctx, args.dq_full.strip().lower() == "true")
+        case "purge":
+            purge(ctx)
         case "cleanup":
             cleanup(ctx)
+        case "rotate":
+            rotate(ctx, _csv_set(args.objects))
         case "backfill":
             backfill(ctx, args.fields)
         case "seed":

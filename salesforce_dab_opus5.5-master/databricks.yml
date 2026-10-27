@@ -2,6 +2,8 @@
 # Values marked TODO must be filled in before the first deploy.
 bundle:
   name: salesforce_ingest
+  # The ops dashboard's dataset_catalog / dataset_schema need a recent CLI (B-34).
+  databricks_cli_version: ">= 0.299.0"
 
 include:
   - resources/*.yml
@@ -32,14 +34,16 @@ variables:
   warehouse_id:
     description: SQL warehouse for the ops alerts and dashboard
   schedule_pause_status:
-    description: UNPAUSED or PAUSED for the nightly and weekly schedules
-    default: UNPAUSED
+    description: >-
+      UNPAUSED or PAUSED for the nightly schedule. Paused by default, so a first deploy never loads Salesforce before
+      the seed (runbook §5.13, B-34); set it to UNPAUSED in the target once the environment is seeded.
+    default: PAUSED
   ingest_workers:
     description: Objects the ingest task runs at a time, in threads of one Spark session (mostly waiting on Salesforce)
     default: 4
   long_task_timeout_seconds:
     description: >-
-      Timeout of the ingest, backfill and seed tasks. The other tasks get one hour. Timeouts are per task, not per
+      Timeout of the ingest, backfill, seed and rotate tasks. The other tasks get one hour. Timeouts are per task, not per
       job, so the tasks after a timed-out one (views, dq, cleanup) still run and delete the landing files.
     default: 21600
   sf_cluster:
@@ -70,7 +74,9 @@ variables:
 workspace:
   # UAT and PROD share one workspace (NFR-06).
   host: https://adb-TODO.azuredatabricks.net
-  root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+  # In the service principal's folder whoever deploys, so only CI deploying as that principal (and workspace admins)
+  # can change the deployed bundle (B-29).
+  root_path: /Workspace/Users/${var.service_principal_app_id}/.bundle/${bundle.name}/${bundle.target}
 
 targets:
   uat:
@@ -82,6 +88,8 @@ targets:
       service_principal_app_id: TODO-sp-sf-ingest-uat-application-id
       cluster_policy_id: TODO-uat-policy-id
       warehouse_id: TODO-warehouse-id
+      # UNPAUSED once roojai_th_uat is seeded (runbook §5.13).
+      schedule_pause_status: PAUSED
 
   prod:
     mode: production
@@ -91,3 +99,5 @@ targets:
       service_principal_app_id: TODO-sp-sf-ingest-prod-application-id
       cluster_policy_id: TODO-prod-policy-id
       warehouse_id: TODO-warehouse-id
+      # UNPAUSED once roojai_th_prod is seeded (runbook §5.13).
+      schedule_pause_status: PAUSED

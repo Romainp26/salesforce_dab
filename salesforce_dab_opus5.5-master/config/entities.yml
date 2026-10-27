@@ -11,9 +11,27 @@ bulk_page_size: 100000
 # objects with `split_full_reload: true` (one range per year, run in parallel).
 full_reload_split_from: "2012-01-01"
 
-# PII encryption (D-07, B-13). Roojai and Kumka share one key and IV.
+# Hours without a successful ingest after which an object raises the `object_freshness` warning (B-23).
+freshness_hours: 36
+
+# Hard-delete check of incremental objects (B-25): every `every_days` days an Id-only queryAll extract is compared
+# with the current SCD2 records; missing ones get a hard-deleted version, hidden in the views. A check that would flag
+# more than `max_deleted_share` of the current records fails the object instead. every_days: 0 turns it off.
+reconcile:
+  every_days: 7
+  max_deleted_share: 0.05
+
+# Unity Catalog groups that preflight grants to (B-29); {catalog} becomes e.g. roojai_th_prod.
+access:
+  readers: sf_readers_{catalog}                  # SELECT on the bronze_salesforce views
+  history_readers: sf_history_readers_{catalog}  # SELECT on bronze_salesforce_scd2 (every version, ciphertext)
+  operators: sf_operators_{catalog}              # SELECT on ops_salesforce; runs the jobs
+  pii_readers: pii_readers_{catalog}             # EXECUTE on ops_salesforce.decrypt_pii and decrypt_pii_at
+
+# PII encryption (D-07, B-13). Each entity reads its key from its own scope (B-22); whether Roojai and Kumka hold the
+# same key value there (cross-entity joins on ciphertext) or different ones (isolation) is open question Q11.
 # Stored value: base64 (no line breaks) of Spark's aes_encrypt CBC output, which starts with the 16-byte IV.
-# The key is 32 random bytes and the IV 16 random bytes, both stored base64 in the environment's secret scope:
+# The key is 32 random bytes and the IV 16 random bytes, both stored base64 in the entity's PII secret scope:
 #   python -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"   # key
 #   python -c "import os, base64; print(base64.b64encode(os.urandom(16)).decode())"   # IV
 pii:
@@ -25,16 +43,20 @@ pii:
   base64_line_breaks: false
   aes_key_secret: sf-pii-aes-key
   aes_iv_secret: sf-pii-aes-iv
+  # Keys replaced by a rotation, in the same scope, read only by the rotate task (runbook §5.12, B-27):
+  #   - {key_version: 1, aes_key_secret: sf-pii-aes-key, aes_iv_secret: sf-pii-aes-iv}
+  previous_keys: []
   # The key that encrypted the backup_salesforce data (Synapse, salesforce_dab): the seed decrypts with it and
   # re-encrypts with the key above. Remove once every environment is seeded.
   legacy:
-    secret_scope: TH-BI-databricks-kv  # TODO confirm; defaults to the environment's scope when omitted
+    secret_scope: TH-BI-databricks-kv  # TODO confirm; defaults to the entity's PII scope when omitted
     key_encoding: utf8
     iv_encoding: hex
     aes_key_secret: sf-encryption-key
     aes_iv_secret: sf-encryption-iv
 
-# One secret scope (Key Vault backed) per environment.
+# One secret scope (Key Vault backed) per environment for the Salesforce JWT secrets: READ for the service principal
+# only, never for a user or group (B-22). The PII keys live in each entity's pii_secret_scopes.
 environments:
   uat:
     secret_scope: sf-ingest-uat  # TODO
@@ -46,6 +68,11 @@ entities:
     country: th
     # D-23: records deleted by these users are archived, not soft-deleted.
     archival_user_ids: ["0052r0000018PjjAAE", "00528000001b87GAAQ"]
+    # AES key and IV (pii.aes_key_secret, pii.aes_iv_secret): READ for the service principal and
+    # pii_readers_<catalog> only (B-22).
+    pii_secret_scopes:
+      uat: sf-pii-roojai-uat  # TODO
+      prod: sf-pii-roojai-prod  # TODO
     secrets:
       consumer_key: roojai-sf-consumer-key
       # PEM private key (optionally followed by its certificate) or a base64 PFX.
@@ -65,6 +92,9 @@ entities:
   kumka:
     country: th
     archival_user_ids: []  # TODO
+    pii_secret_scopes:
+      uat: sf-pii-kumka-uat  # TODO
+      prod: sf-pii-kumka-prod  # TODO
     secrets:
       consumer_key: kumka-sf-consumer-key
       private_key: kumka-sf-jwt-key

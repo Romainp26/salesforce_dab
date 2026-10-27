@@ -80,16 +80,23 @@ class BulkClient:
         return f"{self._session.instance_url}/services/data/v{self._api_version}/jobs/query{path}"
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
-        """Send one request, re-authenticating once on 401 and backing off on throttling or 5xx."""
+        """Send one request, re-authenticating once on 401 and backing off on throttling or 5xx.
+
+        A POST creates a query job, so it is retried only when Salesforce can't have received it (a connect timeout)
+        or refused it (429): a read timeout or a 5xx may already have created the job, and a retry would leave a
+        duplicate one running (B-34).
+        """
         reauthed = False
         attempt = 0
+        idempotent = method != "POST"
+        retry_statuses = RETRY_STATUSES if idempotent else {429}
         while True:
             attempt += 1
             headers = {"Authorization": f"Bearer {self._session.access_token}", **kwargs.pop("headers", {})}
             try:
                 resp = self._http.request(method, self._url(path), headers=headers, timeout=300, **kwargs)
             except (requests.ConnectionError, requests.Timeout) as exc:
-                if attempt >= self._max_attempts:
+                if attempt >= self._max_attempts or not (idempotent or isinstance(exc, requests.ConnectTimeout)):
                     raise
                 log.warning("Bulk API %s %s failed (%s); retrying", method, path, type(exc).__name__)
                 self._sleep(self._backoff * 2 ** (attempt - 1))
@@ -99,7 +106,7 @@ class BulkClient:
                 reauthed = True
                 self._session.refresh()
                 continue
-            if resp.status_code in RETRY_STATUSES and attempt < self._max_attempts:
+            if resp.status_code in retry_statuses and attempt < self._max_attempts:
                 resp.close()
                 log.warning("Bulk API %s %s returned %s; retrying", method, path, resp.status_code)
                 self._sleep(self._backoff * 2 ** (attempt - 1))
@@ -195,5 +202,11 @@ class BulkClient:
     def query_to_files(self, soql: str, page_size: int, next_page_path: Callable[[], Path]) -> QueryResult:
         job_id = self.create_job(soql)
         log.info("Bulk job %s created", job_id)
-        self.wait_for_job(job_id)
-        return self.download_pages(job_id, page_size, next_page_path)
+        info = self.wait_for_job(job_id)
+        result = self.download_pages(job_id, page_size, next_page_path)
+        # The job's own count is exact, unlike a later COUNT(): a short download must never advance the watermark
+        # past the records it lost (B-35).
+        expected = info.get("numberRecordsProcessed")
+        if expected is not None and int(expected) != result.records:
+            raise BulkQueryError(f"Bulk job {job_id} processed {expected} records but {result.records} were downloaded")
+        return result

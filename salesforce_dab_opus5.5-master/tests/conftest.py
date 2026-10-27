@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from sf_ingest.config import OPS_SCHEMA, SCD2_SCHEMA, VIEW_SCHEMA, ObjectConfig, PiiSettings
+from sf_ingest.config import BACKUP_SCHEMA, OPS_SCHEMA, SCD2_SCHEMA, VIEW_SCHEMA, ObjectConfig, PiiSettings
 from sf_ingest.encrypt import CipherSpec
 from sf_ingest.metadata import FieldInfo
 
@@ -56,7 +56,7 @@ def catalog(spark):
     """A clean set of schemas in the local catalog, with the ops tables created."""
     from sf_ingest import ops
 
-    for schema in (SCD2_SCHEMA, VIEW_SCHEMA, OPS_SCHEMA):
+    for schema in (SCD2_SCHEMA, VIEW_SCHEMA, OPS_SCHEMA, BACKUP_SCHEMA):
         spark.sql(f"DROP SCHEMA IF EXISTS `{CATALOG}`.`{schema}` CASCADE")
     ops.ensure_ops_tables(spark, CATALOG)
     return CATALOG

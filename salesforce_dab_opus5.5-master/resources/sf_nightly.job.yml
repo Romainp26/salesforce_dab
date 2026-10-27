@@ -1,5 +1,5 @@
 # One nightly job per catalog (D-16). Only Roojai until phase 2 (D-22): Kumka is a copy of this job
-# with "roojai" replaced by "kumka".
+# with "roojai" replaced by "kumka". The config comes from the wheel, not the workspace files (B-29).
 #
 # Every task runs on the same classic job cluster behind the NAT gateway (D-03, D-04). The ingest task runs
 # every object in parallel threads of one Spark session, longest first: per object it extracts, merges into
@@ -19,6 +19,10 @@ resources:
       email_notifications:
         on_failure:
           - ${var.alert_email}
+      # Operators run and repair the job; it runs as the service principal (runbook §6, B-29).
+      permissions:
+        - group_name: sf_operators_roojai_th_${bundle.target}
+          level: CAN_MANAGE_RUN
       parameters:
         - name: objects
           # Comma-separated objects to run, empty for every configured object. Naming a paused object runs it.
@@ -26,6 +30,13 @@ resources:
         - name: full_reload
           # Comma-separated objects to extract in full, e.g. "Account,Opportunity" (design: Recovery).
           default: ""
+        - name: rewrite
+          # Comma-separated objects to extract in full and correct where stored values differ from Salesforce at an
+          # unchanged watermark: formula drift, a past bad load (B-33).
+          default: ""
+        - name: dq_full
+          # "true" checks every row tonight; Sundays always do (B-37).
+          default: "false"
         - name: workers
           # Objects at a time.
           default: "${var.ingest_workers}"
@@ -40,8 +51,7 @@ resources:
           python_wheel_task:
             package_name: sf_ingest
             entry_point: sf_ingest
-            parameters: [preflight, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
-                         --config-dir, "${workspace.file_path}/config"]
+            parameters: [preflight, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}"]
           libraries:
             - whl: ../dist/*.whl
 
@@ -54,9 +64,9 @@ resources:
             package_name: sf_ingest
             entry_point: sf_ingest
             parameters: [ingest, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
-                         --config-dir, "${workspace.file_path}/config",
                          "--objects={{job.parameters.objects}}",
                          "--full-reload={{job.parameters.full_reload}}",
+                         "--rewrite={{job.parameters.rewrite}}",
                          "--workers={{job.parameters.workers}}"]
           libraries:
             - whl: ../dist/*.whl
@@ -70,8 +80,7 @@ resources:
           python_wheel_task:
             package_name: sf_ingest
             entry_point: sf_ingest
-            parameters: [views, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
-                         --config-dir, "${workspace.file_path}/config"]
+            parameters: [views, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}"]
           libraries:
             - whl: ../dist/*.whl
 
@@ -85,7 +94,21 @@ resources:
             package_name: sf_ingest
             entry_point: sf_ingest
             parameters: [dq, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
-                         --config-dir, "${workspace.file_path}/config"]
+                         "--dq-full={{job.parameters.dq_full}}"]
+          libraries:
+            - whl: ../dist/*.whl
+
+        # Removes the history that in-place PII rewrites (encryption, decryption, rotation) leave behind (B-21).
+        - task_key: purge
+          depends_on:
+            - task_key: dq
+          run_if: ALL_DONE
+          timeout_seconds: 3600
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [purge, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}"]
           libraries:
             - whl: ../dist/*.whl
 
@@ -96,13 +119,13 @@ resources:
             - task_key: ingest
             - task_key: views
             - task_key: dq
+            - task_key: purge
           run_if: ALL_DONE
           timeout_seconds: 3600
           job_cluster_key: sf
           python_wheel_task:
             package_name: sf_ingest
             entry_point: sf_ingest
-            parameters: [cleanup, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
-                         --config-dir, "${workspace.file_path}/config"]
+            parameters: [cleanup, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}"]
           libraries:
             - whl: ../dist/*.whl

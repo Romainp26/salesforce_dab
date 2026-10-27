@@ -4,6 +4,7 @@ import pytest
 
 from sf_ingest import ops
 from sf_ingest.config import ObjectConfig
+from sf_ingest.encrypt import pii_keys
 from sf_ingest.metadata import FieldInfo
 from sf_ingest.scd2 import UncastableValues, scd2_table
 from sf_ingest.seed import match_columns, seed, to_first_versions
@@ -106,9 +107,36 @@ def test_seed_loads_backup_tables_and_seeds_watermarks(spark, catalog, spec, leg
     assert len(rows) == 2
     # Watermark: highest SystemModstamp (Bangkok) minus 7 hours.
     assert ops.get_watermark(spark, catalog, "Account") == datetime(2024, 5, 2, 2, 0, tzinfo=UTC)
-    assert ops.encryption_state(spark, catalog, "Account") == {"Phone__c", "Name"}
+    assert ops.encryption_state(spark, catalog, "Account") == set(pii_keys(obj))
+    assert any(k.startswith("Name@") for k in pii_keys(obj))  # the conditional key names its rule
     checks = {r.object: r for r in spark.table(ops.ops_table(catalog, "dq_results")).collect()}
     assert checks["Account"].passed and not checks["Lead"].passed  # Lead has no backup table
 
     with pytest.raises(RuntimeError, match="Seed failed"):  # never over existing data
         seed(ctx, {"Account"})
+
+
+def test_seeded_records_hash_like_nightly_ones(spark, catalog, spec, legacy_spec, tmp_path):
+    """B-38: the seed hashes the same stored values as the nightly load, and turns '' into null like it."""
+    from sf_ingest.scd2 import load_object
+
+    from .conftest import write_page
+
+    obj = account_config(encrypted_fields=("Phone__c",))
+    ctx = FakeContext(spark, spec, [obj])
+    ctx._legacy = legacy_spec
+    rows = backup_rows()
+    rows[1] = (*rows[1][:3], "", *rows[1][4:])  # an empty phone in the backup
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{CATALOG}`.`backup_salesforce`")
+    spark.createDataFrame(rows, BACKUP_SCHEMA).write.saveAsTable(f"{CATALOG}.backup_salesforce.account")
+    ops.write_run_plan(spark, catalog, "r1", {"Account": [f.to_dict() for f in FIELDS]})
+    seed(ctx, set())
+    table = scd2_table(catalog, obj)
+    assert {r.Id: r.Phone__c for r in spark.table(table).collect()}["001B"] is None
+
+    # The same record, unchanged, with a later SystemModstamp: same hash, so no new version.
+    header = [f.name for f in FIELDS]
+    page = [["001B", "Acme Co", "Business", "", "true", "005ARCH", "", "2024-05-03T02:00:00.000Z"]]
+    write_page(tmp_path / "n1", 1, header, page)
+    stats = load_object(spark, catalog, obj, FIELDS, tmp_path / "n1", ("005ARCH",), spec, 1, "n1")
+    assert stats.versions_written == 0

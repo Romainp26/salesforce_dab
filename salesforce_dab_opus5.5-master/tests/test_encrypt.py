@@ -7,7 +7,17 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from pyspark.sql import functions as F
 
 from sf_ingest.config import ObjectConfig
-from sf_ingest.encrypt import CipherSpec, condition_fields, encrypt_columns, is_ciphertext_sql, pin_base64_format
+from sf_ingest.encrypt import (
+    CipherSpec,
+    condition_fields,
+    decrypt_change,
+    encrypt_change,
+    encrypt_columns,
+    is_ciphertext_sql,
+    pii_predicates,
+    pin_base64_format,
+    raw_text_sql,
+)
 
 from .conftest import IV, IV_B64, KEY, KEY_B64, LEGACY_IV_HEX, LEGACY_KEY_TEXT, PII, account_config
 
@@ -139,3 +149,61 @@ def test_condition_fields_reads_identifiers_outside_string_literals():
 def test_conditional_rule_is_skipped_when_its_columns_are_absent(spark, spec):
     df = spark.createDataFrame([("1", "North")], "Id STRING, Region__c STRING")  # no Type: the rule can't run
     assert encrypt_columns(df, account_config(), spec).collect()[0].Region__c == "North"
+
+
+def test_the_rule_reads_plaintext_even_when_a_column_it_reads_is_encrypted(spark, spec):
+    # Config validation refuses this combination (B-26); the order still guarantees the rule sees plaintext.
+    obj = replace(account_config(), encrypted_fields=("Type",))
+    df = spark.createDataFrame([("1", "Jane", "Customer")], "Id STRING, Name STRING, Type STRING")
+    row = encrypt_columns(df, obj, spec).first()
+    assert (row.Name, row.Type) == (reference_ciphertext("Jane"), reference_ciphertext("Customer"))
+
+
+def test_history_rules_skip_history_objects_without_values(spark, spec):
+    # OpportunityHistory has no Field/OldValue/NewValue; Opportunity's PII reaches it through the parent (B-21).
+    obj = ObjectConfig(name="OpportunityHistory", watermark="CreatedDate", history_encryption=("Mobile__c",))
+    df = spark.createDataFrame([("h1", "Prospecting")], "Id STRING, StageName STRING")
+    assert encrypt_columns(df, obj, spec).first().StageName == "Prospecting"
+    assert pii_predicates(obj, {"id", "stagename"}) == []
+
+
+def test_raw_text_rebuilds_what_bulk_csv_returns(spark):
+    row = (
+        spark.sql(
+            "SELECT DATE'1990-01-31' AS d, TIMESTAMP_NTZ'2024-05-01 09:00:00' AS ts, true AS b, "
+            "CAST(10.50 AS DECIMAL(18,2)) AS m, CAST(1500 AS DECIMAL(18,2)) AS w, 42 AS i"
+        )
+        .select(
+            F.expr(raw_text_sql("d", "date")),
+            F.expr(raw_text_sql("ts", "timestamp_ntz")),
+            F.expr(raw_text_sql("b", "boolean")),
+            F.expr(raw_text_sql("m", "decimal(18,2)")),
+            F.expr(raw_text_sql("w", "decimal(18,2)")),
+            F.expr(raw_text_sql("i", "int")),
+        )
+        .first()
+    )
+    # Datetimes go back to the landed UTC text: a value encrypted in place matches later loads (B-24).
+    assert tuple(row) == ("1990-01-31", "2024-05-01T02:00:00.000Z", "true", "10.5", "1500", "42")
+
+
+def test_decrypt_change_restores_plaintext_and_keeps_other_values(spark, spec):
+    df = spark.createDataFrame(
+        [(reference_ciphertext("Jane"),), ("Acme Co",), (None,), (reference_ciphertext("x", key=bytes(32)),)],
+        "Name STRING",
+    )
+    changes, where = decrypt_change("Name", spec)
+    got = [r[0] for r in df.select(F.expr(changes["Name"])).collect()]
+    # A business-account name stays; ciphertext of another key stays too rather than becoming null.
+    assert got == ["Jane", "Acme Co", None, reference_ciphertext("x", key=bytes(32))]
+    assert where == "`Name` IS NOT NULL"
+    assert decrypt_change("history:Phone", spec)[1] == "lower(Field) IN ('phone')"
+    # AccountHistory records a Name change as TextName.
+    assert decrypt_change("history:Name", spec)[1] == "lower(Field) IN ('name', 'textname')"
+
+
+def test_encrypt_change_encrypts_the_raw_text_of_typed_columns(spark, spec):
+    changes, where = encrypt_change(ObjectConfig(name="Account"), "Birth__c", spec, "date")
+    df = spark.sql("SELECT DATE'1990-01-31' AS Birth__c")
+    assert df.select(F.expr(changes["Birth__c"])).first()[0] == reference_ciphertext("1990-01-31")
+    assert where == "`Birth__c` IS NOT NULL"

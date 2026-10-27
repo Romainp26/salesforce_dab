@@ -123,6 +123,9 @@ class ExtractOutcome:
     records: int = 0
     sf_count: int | None = None
     api: str = "bulk"
+    # The extract's upper bound: a version this run writes "tonight" starts here, so a change made while the run
+    # loads is newer and arrives with the next one.
+    started_utc: datetime | None = None
 
 
 def extract_object(
@@ -140,7 +143,7 @@ def extract_object(
     shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True)
     namer = PageNamer(out_dir)
-    outcome = ExtractOutcome()
+    outcome = ExtractOutcome(started_utc=now_utc)
     where = build_where(obj, watermark_utc, now_utc, full)
 
     def rest():

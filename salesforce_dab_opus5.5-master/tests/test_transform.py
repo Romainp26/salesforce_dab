@@ -61,3 +61,27 @@ def test_history_datetime_values_shift_without_trailing_z(spark):
 def test_history_without_values_is_unchanged(spark):
     df = spark.createDataFrame([("o1", "Prospecting")], "OpportunityId STRING, StageName STRING")
     assert shift_history_values(df).collect() == df.collect()
+
+
+def test_a_decimal_cast_that_would_round_does_not_fit(spark):
+    from sf_ingest.transform import does_not_fit
+
+    df = spark.createDataFrame([("1.2345",), ("1.2",), ("abc",), (None,)], "v STRING")
+    got = [r[0] for r in df.select(does_not_fit(F.col("v"), "DECIMAL(18,2)")).collect()]
+    # A scale increase in Salesforce must never round silently (B-32).
+    assert got == [True, False, True, False]
+
+
+def test_type_change_rules():
+    from sf_ingest.transform import type_change
+
+    assert type_change("decimal(18,2)", "DECIMAL(18,2)") == "keep"
+    assert type_change("string", "DECIMAL(18,2)") == "keep"
+    assert type_change("decimal(18,4)", "DECIMAL(16,2)") == "keep"  # already wider
+    assert type_change("decimal(16,2)", "DECIMAL(18,4)") == "widen"
+    assert type_change("decimal(18,2)", "DECIMAL(18,4)") == "incompatible"  # fewer integer digits
+    assert type_change("int", "BIGINT") == "widen"
+    assert type_change("bigint", "INT") == "keep"
+    assert type_change("timestamp_ntz", "DATE") == "incompatible"
+    assert type_change("date", "TIMESTAMP_NTZ") == "incompatible"
+    assert type_change("decimal(18,2)", "STRING") == "incompatible"

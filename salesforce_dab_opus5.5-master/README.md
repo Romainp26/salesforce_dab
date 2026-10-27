@@ -25,26 +25,29 @@ The agreed requirements and design are in `shared_folder/salesforce-ingestion-de
 
 ## At a glance
 
-- **Jobs**, one set per catalog: nightly ingest, on-demand field backfill, one-off seed from `backup_salesforce` (the clone of the Synapse tables). The nightly job is `preflight → ingest → views → dq → cleanup` on one single-node classic cluster (Databricks Runtime 18 LTS, Photon) behind the NAT gateway. Predictive optimization maintains the tables. The ingest task runs objects in parallel, longest first, and its output tells the story of the night.
+- **Jobs**, one set per catalog: nightly ingest, on-demand field backfill, one-off seed from `backup_salesforce` (the clone of the Synapse tables), on-demand PII key rotation. The nightly job is `preflight → ingest → views → dq → purge → cleanup` on one single-node classic cluster (Databricks Runtime 18 LTS, Photon) behind the NAT gateway. Predictive optimization maintains the tables. The ingest task runs objects in parallel, longest first, and its output tells the story of the night.
 - **Catalogs**: `<entity>_th_<env>` (`roojai_th_uat`, `roojai_th_prod`), each with these schemas:
   - `bronze_salesforce_scd2`: SCD2 tables, every version
   - `bronze_salesforce`: policy views, current versions
   - `ops_salesforce`: run log, watermarks, field allowlist and approvals, DQ results, landing volume
   - `backup_salesforce`: the manual clone of the Synapse tables, read once by the seed.
-- **Config**: `config/entities.yml` (orgs, secrets, PII key format) and `config/objects/<entity>.yml` (124 Roojai objects and their policies), reviewed by pull request.
+- **Config**: `config/entities.yml` (orgs, secrets, PII key format, access groups), `config/objects/<entity>.yml` (124 Roojai objects and their policies) and `config/approvals/<entity>.yml` (decisions on new fields), reviewed by pull request and packaged in the wheel.
 - **Safety**:
-  - PII is encrypted deterministically (AES-CBC with a static IV) before it reaches a table, and decryptable only by `pii_readers_<catalog>`
-  - plaintext exists only in landing files, deleted after each object
+  - PII is encrypted deterministically (AES-CBC with a static IV) before it reaches a table, `*History` objects included, and decryptable only by `pii_readers_<catalog>`
+  - in this pipeline, plaintext exists only in landing files, deleted after each object (outside it: `backup_salesforce` until it is dropped, and storage-level copies such as blob soft delete, Q14); a change to the PII config rewrites every version and then purges the old ones from the table's history (B-21)
+  - the Salesforce JWT key and the PII key live in separate secret scopes (B-22)
   - runs are idempotent and repairable
   - failures and failed checks alert.
+
+  The audit of 2026-10-26 and what changed after it: [docs/audit-2026-10-26.md](docs/audit-2026-10-26.md), decisions B-21 to B-38.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
 | `databricks.yml` | Bundle, `uat` / `prod` targets, variables, the job cluster |
-| `resources/` | Jobs (nightly, backfill, seed), SQL alerts, dashboard |
-| `config/` | `entities.yml`, `objects/<entity>.yml`, `seed/<entity>_fields_allowlist.csv` |
+| `resources/` | Jobs (nightly, backfill, seed, rotate), SQL alerts, dashboard |
+| `config/` | `entities.yml`, `objects/<entity>.yml`, `approvals/<entity>.yml`, `seed/<entity>_fields_allowlist.csv` |
 | `src/sf_ingest/` | The Python package (wheel). `tasks.py` is the entry point, one subcommand per job task |
 | `dashboards/` | Ops dashboard |
 | `scripts/generate_config.py` | One-off generator of the object config from the source CSVs |

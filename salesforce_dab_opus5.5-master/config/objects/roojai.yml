@@ -1,6 +1,7 @@
 # Object configuration for roojai. Generated on 2026-10-26 by scripts/generate_config.py
 # from objects_allowlist_and_watermarks.csv and encrypted_fields.txt; edit by pull request from now on.
 # Keys: see ObjectConfig in src/sf_ingest/config.py. Objects list only what differs from defaults.
+# *History objects also encrypt OldValue/NewValue for every PII field of their parent object (B-21).
 defaults:
   api: bulk
   watermark: SystemModstamp
@@ -12,8 +13,9 @@ defaults:
 objects:
 - name: Account
   new_fields: require-approval
+  # Mobile_Formula__pc and Phone_Formula__pc: formula copies of the person-account phones (B-31).
   encrypted_fields: [Active_Phone_No__c, Active_Email__c, ACCOUNT_NAME__c, PP_no_as_unique__c, House_Number_Building_Number__c,
-    Thai_Identification_Number__c, Contact_Individual_Passport_Number__c]
+    Thai_Identification_Number__c, Contact_Individual_Passport_Number__c, Mobile_Formula__pc, Phone_Formula__pc]
   # Person-account names only; business accounts stay readable (design: PII encryption).
   conditional_encryption:
     columns: [Name, FirstName, LastName]
@@ -22,7 +24,8 @@ objects:
 - {name: AccountFeed}
 - name: AccountHistory
   watermark: CreatedDate
-  # Four of these fields are excluded from Account itself, so the history holds their only copy.
+  # Four of these fields are excluded from Account itself, so the history holds their only copy. Account's own PII
+  # fields are added to this list automatically, as for every *History object of a PII object (B-21).
   history_encryption:
     fields: [PersonEmail, Phone, Thai_Identification_Number__c, Contact_Email_Address__c, PersonMobilePhone]
 - {name: Asset}

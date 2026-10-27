@@ -50,7 +50,8 @@ def test_auto_add_queries_new_fields_and_skips_exclusions():
     assert [f.name for f in plan.auto_added] == ["New__c"]
     assert plan.pending == []
     # allowed = 0, compound and base64 fields are never queried nor reported as new (D-19).
-    assert plan.removed == [] and plan.retyped == []
+    # An allowed field Salesforce doesn't describe is reported on the first run too, and every night (B-32).
+    assert plan.removed == ["gone__c"] and plan.retyped == []
 
 
 def test_require_approval_leaves_new_fields_out():
@@ -71,6 +72,30 @@ def test_removed_and_retyped_fields_are_reported_against_the_previous_snapshot()
     plan = plan_fields(ObjectConfig(name="Account"), DESCRIBED, ALLOWLIST, previous)
     assert plan.removed == ["gone__c"]
     assert plan.retyped == [("Name", "textarea", "string")]
+    # Reported every night, until it is described again or excluded.
+    assert plan_fields(ObjectConfig(name="Account"), DESCRIBED, ALLOWLIST, {"id": "id"}).removed == ["gone__c"]
+
+
+def test_precision_and_scale_changes_are_retypes():
+    described = [
+        FieldInfo("Id", "id"),
+        FieldInfo("Amount__c", "currency", 0, 18, 4),
+        FieldInfo("SystemModstamp", "datetime"),
+    ]
+    previous = {f.name.lower(): f for f in described}
+    previous["amount__c"] = FieldInfo("Amount__c", "currency", 0, 16, 2)
+    allow = {"id": 1, "amount__c": 1, "systemmodstamp": 1}
+    plan = plan_fields(ObjectConfig(name="Opportunity"), described, allow, previous)
+    assert plan.retyped == [("Amount__c", "currency(16,2)", "currency(18,4)")]
+
+
+def test_pii_fields_must_be_described():
+    obj = ObjectConfig(name="Account", new_fields="require-approval", encrypted_fields=("Phone_c",))
+    # A typo, or a field hidden from the integration user, fails the object instead of storing plaintext (B-26).
+    with pytest.raises(ValueError, match=r"\['Phone_c'\] are not in Salesforce's describe"):
+        plan_fields(obj, DESCRIBED, ALLOWLIST, None)
+    ok = ObjectConfig(name="Account", new_fields="require-approval", encrypted_fields=("secret__C",))
+    assert plan_fields(ok, DESCRIBED, ALLOWLIST, None).query_fields
 
 
 def test_id_and_watermark_are_required():

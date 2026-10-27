@@ -34,6 +34,10 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/sf_ingest"]
 
+# The jobs read the config from the wheel, so it always matches the code deployed with it (B-29).
+[tool.hatch.build.targets.wheel.force-include]
+"config" = "sf_ingest/_config"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["spark: needs a local Spark session with Delta (Java 17)"]

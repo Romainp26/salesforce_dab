@@ -9,6 +9,10 @@ resources:
       email_notifications:
         on_failure:
           - ${var.alert_email}
+      # Operators run and repair the job; it runs as the service principal (runbook §6, B-29).
+      permissions:
+        - group_name: sf_operators_roojai_th_${bundle.target}
+          level: CAN_MANAGE_RUN
       parameters:
         - name: objects
           # Comma-separated objects; empty seeds every configured object that has a backup table.
@@ -24,8 +28,7 @@ resources:
           python_wheel_task:
             package_name: sf_ingest
             entry_point: sf_ingest
-            parameters: [preflight, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
-                         --config-dir, "${workspace.file_path}/config"]
+            parameters: [preflight, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}"]
           libraries:
             - whl: ../dist/*.whl
 
@@ -38,7 +41,7 @@ resources:
             package_name: sf_ingest
             entry_point: sf_ingest
             parameters: [seed, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
-                         --config-dir, "${workspace.file_path}/config", "--objects={{job.parameters.objects}}"]
+                         "--objects={{job.parameters.objects}}"]
           libraries:
             - whl: ../dist/*.whl
 
@@ -52,7 +55,6 @@ resources:
           python_wheel_task:
             package_name: sf_ingest
             entry_point: sf_ingest
-            parameters: [views, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
-                         --config-dir, "${workspace.file_path}/config"]
+            parameters: [views, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}"]
           libraries:
             - whl: ../dist/*.whl

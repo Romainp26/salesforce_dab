@@ -1,0 +1,9 @@
+# Decisions on new Salesforce fields (D-09, B-28), reviewed by pull request and applied by preflight in every
+# environment. New fields of `require-approval` objects wait as `pending` in ops_salesforce.field_approval until a
+# decision is listed here. An approved field with `pii: true` must already be in its object's encrypted_fields (or
+# conditional_encryption): config validation refuses it otherwise. Example:
+#
+# - {object: Account, field: Loyalty_Tier__c, decision: approved, pii: false, decided_by: jane.doe, decided_on: 2026-11-02}
+# - {object: Account, field: Spouse_Mobile__c, decision: approved, pii: true, decided_by: jane.doe, decided_on: 2026-11-02}
+# - {object: Claim__c, field: Old_Score__c, decision: rejected, decided_by: jane.doe, decided_on: 2026-11-02}
+[]

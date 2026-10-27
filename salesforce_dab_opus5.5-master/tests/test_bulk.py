@@ -178,3 +178,43 @@ def test_a_job_still_running_after_the_maximum_wait_is_aborted():
     abort = responses.calls[-1].request
     assert (abort.method, json.loads(abort.body)) == ("PATCH", {"state": "Aborted"})
     assert now[0] == 300
+
+
+@responses.activate
+def test_a_download_shorter_than_the_job_fails(tmp_path):
+    """The job's own count is exact: a short download must fail the object, not advance the watermark (B-35)."""
+    responses.post(BASE, json={"id": "750S"})
+    responses.get(f"{BASE}/750S", json={"state": "JobComplete", "numberRecordsProcessed": 3})
+    responses.get(f"{BASE}/750S/results", body=b'"Id"\n"001A"\n', headers={"Sforce-NumberOfRecords": "1"})
+    with pytest.raises(BulkQueryError, match="processed 3 records but 1 were downloaded"):
+        client().query_to_files("SELECT Id FROM Account", 10, namer(tmp_path))
+
+
+@responses.activate
+def test_matching_counts_pass(tmp_path):
+    responses.post(BASE, json={"id": "750M"})
+    responses.get(f"{BASE}/750M", json={"state": "JobComplete", "numberRecordsProcessed": 1})
+    responses.get(f"{BASE}/750M/results", body=b'"Id"\n"001A"\n', headers={"Sforce-NumberOfRecords": "1"})
+    assert client().query_to_files("SELECT Id FROM Account", 10, namer(tmp_path)).records == 1
+
+
+@responses.activate
+def test_job_creation_is_retried_only_when_salesforce_cant_have_created_it():
+    """A 5xx or a read timeout may have created the job already: no retry, so no duplicate job (B-34)."""
+    responses.post(BASE, status=500)
+    with pytest.raises(BulkQueryError, match="500"):
+        client().create_job("SELECT Id FROM Account")
+    assert len(responses.calls) == 1
+
+    responses.reset()
+    responses.post(BASE, body=requests.ReadTimeout("read timed out"))
+    with pytest.raises(requests.ReadTimeout):
+        client().create_job("SELECT Id FROM Account")
+    assert len(responses.calls) == 1
+
+    responses.reset()
+    responses.post(BASE, status=429)
+    responses.post(BASE, body=requests.ConnectTimeout("connect timed out"))
+    responses.post(BASE, json={"id": "750P"})
+    assert client().create_job("SELECT Id FROM Account") == "750P"
+    assert len(responses.calls) == 3

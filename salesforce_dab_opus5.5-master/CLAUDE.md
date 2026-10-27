@@ -22,40 +22,46 @@ A Databricks Asset Bundle that ingests Salesforce (Roojai now, Kumka in phase 2)
 ## Architecture
 
 **Job flow** (`resources/sf_nightly.job.yml`, one job per catalog, every task on one classic job cluster):
-`preflight → ingest → views → dq → cleanup`. `resources/sf_backfill.job.yml` runs `preflight → backfill → views → cleanup`; `resources/sf_seed.job.yml` (one-off initial load from `backup_salesforce`) runs `preflight → seed → views`. No maintenance job: preflight enables predictive optimization.
+`preflight → ingest → views → dq → purge → cleanup`. `resources/sf_backfill.job.yml` runs `preflight → backfill → views → cleanup`; `resources/sf_seed.job.yml` (one-off initial load from `backup_salesforce`) runs `preflight → seed → views`; `resources/sf_rotate.job.yml` (PII key rotation) runs `preflight → rotate → purge`. No maintenance job: preflight enables predictive optimization, and the purge task runs REORG and VACUUM where PII was rewritten in place.
 - Each task is a subcommand in `src/sf_ingest/tasks.py`. Tasks after ingest run with `run_if: ALL_DONE`. Every task has a `timeout_seconds`, per task and never per job: a job timeout would cancel `cleanup` and leave plaintext landing files (B-20).
 - Preflight writes the per-object field list to `ops_salesforce.run_plan`, keyed by `run_id` (the job run id).
-- `tasks.ingest` runs every object in a thread pool (`--workers`), ordered by `longest_first`. Per object, `ingest_object` runs extract → load → hard deletes (full loads) → deletes the landing folder, then appends an `ingest` event. A failed object is logged and the task raises at the end. A repair of the same run skips objects that already have an `ingest` event. Each worker thread gets its own FAIR scheduler pool and its own Salesforce session (`Context.session`).
+- The jobs read the config packaged in the wheel (`sf_ingest/_config`, `tasks.PACKAGED_CONFIG`); `--config-dir` is for local runs.
+- `tasks.ingest` runs every object in a thread pool (`--workers`), ordered by `longest_first`. Per object, `ingest_object` runs extract → load → hard deletes (full loads nightly, incremental objects every `reconcile.every_days`) → deletes the landing folder, then appends an `ingest` event. A failed object is logged and the task raises at the end. A repair of the same run skips objects that already have an `ingest` event. Each worker thread gets its own FAIR scheduler pool and its own Salesforce session (`Context.session`).
 - The ingest output is the operator's view of the night: keep the per-object lines and the summary table in `log_summary` when changing it.
 - This departs from the design's for-each tasks; `docs/decision-log.md` (B-xx) records every departure from the design.
 
 **Data path:**
 - `extract.py`/`bulk.py` stream each Bulk API result page unparsed to `/Volumes/<catalog>/ops_salesforce/landing/<object>/<run_id>/page_<n>.csv`.
 - `scd2.py:load_object` reads the pages as strings, then:
+  - on an existing table first: refuses an outdated key, applies PII config changes to every version (`scd2.apply_pii_policy`), fits columns to tonight's types (`scd2.evolve_types`)
   - dedupes per Id
-  - hashes the plaintext tracked fields
   - sets delete/archive flags, encrypts PII, casts types (datetimes become `TIMESTAMP_NTZ` +7h Bangkok)
+  - hashes the stored values (ciphertext, never plaintext)
   - runs a staged-union MERGE.
 - `*History` objects (name ends in `History`) are append-only instead.
 - Watermarks stay UTC and advance only after the MERGE commits.
 
 **Invariants that are easy to break:**
-- **Idempotency.** An incoming row only becomes a version if its `_valid_from` is newer than the current one and its `_row_hash` differs. Replays and the 1-hour overlap are therefore no-ops.
-- **One object never fails preflight.** `tasks.preflight` gives an object it can't describe or plan no `run_plan` row and a `preflight` event: `skipped` when the org lacks it, `failed` otherwise. Ingest reports those objects and fails at the end for the failed ones (B-19). Only setup and authentication errors fail preflight.
+- **Idempotency.** An incoming row only becomes a version if its `_valid_from` is newer than the current one and its `_row_hash` differs. Replays and the 1-hour overlap are therefore no-ops. Exceptions start tonight: a hard-deleted record that is back, and `rewrite` corrections (B-33).
+- **The row hash covers stored values.** `scd2.hash_sql` over typed values with PII as ciphertext, in the nightly load, the seed and every in-place rewrite alike (B-21). Never hash plaintext.
+- **One object never fails preflight.** `tasks.preflight` gives an object it can't describe or plan no `run_plan` row and a `preflight` event: `skipped` when the org lacks it (in PROD only if paused there, B-23), `failed` otherwise. Ingest reports those objects and fails at the end for the failed ones (B-19). Only setup and authentication errors fail preflight.
 - **Partial extracts are never loaded.** `ingest_object` only loads after `extract` returns; an extract error skips the load and the watermark stays.
 - **Concurrent writes.** Worker threads only append to `ops_salesforce.run_events` and `watermark_history`. The `run_log` and `watermarks` views aggregate them. Don't turn these into MERGEs. `run_log.status` is the latest event's status, so a repaired object reads `succeeded`.
 - **Thread safety.** Session-wide Spark settings (`spark.conf.set`) are shared by every worker thread: avoid them in per-object code. The re-encryption commit tag is the one exception, so it is serialised and names its table. Temp views get unique names.
-- **Casts never throw.** `transform.cast_from_string` uses `try_cast`. `scd2.profile_landed` fails the object when any value doesn't fit, with counts per column only: an ANSI cast error would put the value, possibly PII, in the run log.
+- **Casts never throw, never round.** `transform.cast_from_string` uses `try_cast`. `scd2.profile_landed` fails the object when any value doesn't fit (`transform.does_not_fit`, decimal rounding included), with counts per column only: an ANSI cast error would put the value, possibly PII, in the run log.
 - **One place for crypto.** All encryption SQL comes from `encrypt.py:CipherSpec`, which reads the key and IV via `secret()` in prod. Format (B-13): random base64 key and IV, Spark's IV-prefixed output, no base64 line breaks. `CipherSpec.legacy` / `decrypt_any_sql` read the old key's ciphertext and are for the seed only.
-- **PII objects require approval.** Config validation refuses `encrypted_fields` / `conditional_encryption` without `new_fields: require-approval`. `IsDeleted` and `LastModifiedById` are always queried (`metadata.SYSTEM_FIELDS`).
+- **PII objects require approval.** Config validation refuses `encrypted_fields` / `conditional_encryption` without `new_fields: require-approval`, refuses encrypting reserved fields or rule inputs, and preflight fails an object whose PII fields Salesforce doesn't describe (B-26). `IsDeleted` and `LastModifiedById` are always queried (`metadata.SYSTEM_FIELDS`). `*History` objects inherit their parent's PII fields (`config._with_parent_pii`), matched on `Field` case-insensitively and through `encrypt.HISTORY_FIELD_ALIASES` (`TextName` for `Name`).
+- **Approvals are config.** Decisions on new fields live in `config/approvals/<entity>.yml` (B-28); an approved PII field must be encrypted.
+- **Two secret scopes.** Salesforce JWT secrets in `environments.<env>.secret_scope` (service principal only), the AES key in the entity's `pii_secret_scopes` (`Context.spec`, B-22).
 - **Views expose business columns only.** SCD2 columns (`_is_deleted`, `_valid_from`, ...) stay in `bronze_salesforce_scd2`.
-- **Re-encryption runs at most once per column.** Newly listed PII columns are re-encrypted once, tracked in `ops_salesforce.encryption_state` and tagged in the Delta commit metadata. Never encrypt a column outside that path; the field backfill calls it before merging.
-- **Hard deletes.** Only full-load objects (User, GroupMember) are checked, after their load. `scd2.changed_rows` makes a flagged record that is back in the extract current again.
+- **PII config changes go through `scd2.apply_pii_policy`.** It encrypts newly listed keys and decrypts those in `decrypt_fields` in every version, once each: `ops_salesforce.encryption_state` is append-only (latest action wins) and every rewrite is tagged in the Delta commit with a sequence number. It runs every night, even with nothing extracted, and the field backfill calls it before merging. Never rewrite a PII column outside that path or `scd2.rotate_key`.
+- **Every in-place PII rewrite queues a purge** (`ops.request_purge`): Delta keeps the old values in time travel, deletion-vector files and log statistics until the purge task removes them (B-21): REORG, VACUUM at least 12 hours later (never a zero retention: it would delete a concurrent writer's files), then log cleanup.
+- **Hard deletes.** Full-load objects (User, GroupMember) every night after their load; incremental objects every `reconcile.every_days` with an Id-only extract (B-25). Both set `_is_hard_deleted`, which every view hides. A flagged record that is back becomes current again (`scd2.changed_rows`, `deletes.flag_hard_deletes(restore=True)`).
 - **No named SQL parameters.** `spark.sql(..., args=...)` comes back unbound with Spark 4.1 + Delta 4.3 on Delta tables and views. Filter with the DataFrame API, or build literals with `ops.sql_string`.
 - **Plaintext stays out of logs.** Landing files hold plaintext PII. Log counts and IDs only, never field values, and never `display()`/`show()` in job code.
 
 **Config:**
-- `config/objects/<entity>.yml` is the reviewed source of truth for object policies (`ObjectConfig` in `config.py` lists the keys, including `paused: [uat|prod]`). `soql_filter` is only for records Salesforce can't return (the Contract corrupted record); business exclusions go in `view_filter` (D-17).
+- `config/objects/<entity>.yml` is the reviewed source of truth for object policies (`ObjectConfig` in `config.py` lists the keys, including `paused: [uat|prod]`, `decrypt_fields` and `retired`). `soql_filter` is only for records Salesforce can't return (the Contract corrupted record); business exclusions go in `view_filter` (D-17).
 - It was bootstrapped once by `scripts/generate_config.py` from the CSVs in `shared_folder/`, which refuses to overwrite without `--force`.
 - The field allowlist is seeded from `config/seed/` but changes at run time (auto-adds, approvals) in `ops_salesforce.field_allowlist`.
 - Catalog names are derived as `<entity>_<country>_<env>`.

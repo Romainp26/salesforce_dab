@@ -18,6 +18,7 @@ ORDER BY status, object
   - the output lists the fields the backup lacks
   - a failure "don't decrypt with the legacy key" means `pii.legacy` is wrong (scope, secret names or encodings).
 - [ ] As a member of `pii_readers_roojai_th_uat`, decrypt a few seeded values with `ops_salesforce.decrypt_pii` and compare them with Salesforce, for a person Account (`Name`, `Active_Email__c`), an AccountHistory `PersonEmail` change and a long address (over 40 characters).
+- [ ] List the `Field` values each History table of an object with PII holds: `SELECT Field, count(*) FROM roojai_th_uat.bronze_salesforce_scd2.accounthistory GROUP BY Field`. Every value that records a PII field must be that field's name or an alias in `encrypt.HISTORY_FIELD_ALIASES` (AccountHistory writes `TextName` for `Name`); add any other alias found, and check `pii_is_ciphertext` passed for the History table.
 - [ ] After the first nightly run, a record changed in Salesforce since the backup has a second version whose PII decrypts the same way, and `pii_is_ciphertext` passes.
 - [ ] Check that no PII column of the seeded tables still holds legacy ciphertext: `pii_is_ciphertext` passes, and a sample of `decrypt_pii` values is readable text.
 
@@ -66,7 +67,7 @@ Unit tests:
 
 ## 5. Timing and ordering
 
-- [ ] First run: note the ingest duration and the slowest objects in the per-object table, and the node's CPU and memory in the cluster metrics. Adjust `workers`, or choose a bigger node, from them (open question Q6). Check the durations leave room under the task timeouts (`long_task_timeout_seconds`, 6 hours, for ingest and seed; 1 hour for the other tasks), and raise them if a first full load needs more (B-20).
+- [ ] First run: note the ingest duration and the slowest objects in the per-object table, and the node's CPU and memory in the cluster metrics. Adjust `workers`, or choose a bigger node, from them (open question Q6). Check the durations leave room under the task timeouts (`long_task_timeout_seconds`, 6 hours, for ingest, backfill, seed and rotate; 1 hour for the other tasks), and raise them if a first full load needs more (B-20).
 - [ ] Second run: the "longest first" list at the start of the ingest output starts with the slowest objects of the first run.
 
 ## 6. Hard deletes and backfill
@@ -74,3 +75,44 @@ Unit tests:
 - [ ] Deactivating a UAT user changes nothing in the hard-delete check: users are never deleted, only deactivated.
 - [ ] Removing a member from a public group flags its GroupMember record deleted the next night and hides it in the view.
 - [ ] Approve a pending field, let one nightly run pass, then run `sf_backfill_roojai` with that field. Current versions get the value, closed versions stay null and the watermark doesn't move.
+
+## 7. PII policy changes and purges (B-21, B-24)
+
+Use a UAT-only test field, e.g. a text `Audit_Email__c` and a date `Audit_Date__c` on a small object with field history tracking on, so production objects stay untouched.
+
+- [ ] **Encrypt an existing text field.** Add it to `encrypted_fields`, deploy, run the nightly job (no record needs to change). Expected: every version holds ciphertext; `DESCRIBE HISTORY` shows an `UPDATE` tagged `sf_ingest_pii:<table>:encrypt:<field>:1`; the History table's `OldValue`/`NewValue` for that field are ciphertext; `pii_is_ciphertext` passed over every row of the object.
+- [ ] **The old plaintext is gone.** Note the version before the UPDATE (`pii_purge.version`). After the run, `pii_purge` shows `reorged`, with the data files still to delete in `files`, and `SHOW TBLPROPERTIES` lists `delta.deletedFileRetentionDuration = interval 12 hours`. After the next night's purge (12 hours later at least): `pii_purge` shows `files_purged`, `pii_history_purged` passed, `VACUUM <table> DRY RUN` lists none of the recorded files, and `SELECT * FROM <table> VERSION AS OF <version>` fails. Two nights after that, `pii_purge` shows `done`, `DESCRIBE HISTORY` starts after the purge, and `SHOW TBLPROPERTIES` no longer lists `delta.deletedFileRetentionDuration`.
+- [ ] **Encrypt a date field.** As above for `Audit_Date__c`: the column becomes a STRING, and `decrypt_pii` gives back `yyyy-MM-dd`. A record changed after that night has the same ciphertext for the same date (B-24). Also confirm the grants on the table survived the rewrite (Q15).
+- [ ] **Decrypt it again.** Remove the field from `encrypted_fields` without `decrypt_fields`: the object fails with "no longer in the PII config". Add `decrypt_fields: [Audit_Date__c]`: every version is a DATE again, plaintext.
+- [ ] **A typo.** Misspell a field in `encrypted_fields`: preflight fails the object with "are not in Salesforce's describe".
+
+Unit tests:
+- `test_scd2.py::test_newly_flagged_pii_is_encrypted_once_in_every_version`
+- `test_scd2.py::test_encrypting_a_typed_column_rewrites_it_as_string_ciphertext`
+- `test_scd2.py::test_a_field_leaving_the_pii_config_is_decrypted_only_when_acknowledged`
+- `test_tasks.py::test_purge_removes_the_plaintext_history_of_a_re_encrypted_table`
+- `test_tasks.py::test_the_purge_waits_for_the_file_retention_before_vacuuming`
+- `test_metadata.py::test_pii_fields_must_be_described`
+
+## 8. Key rotation (B-27)
+
+- [ ] Follow runbook §5.12 in UAT with a second key: the nightly job refuses PII objects between the deploy and the rotation; after `sf-rotate-roojai_th_uat`, `decrypt_pii` reads every value, `_pii_key_version` is 2 on every row of every object with encrypted values (and their `*History` objects; tables without PII keep the version they were written with), and the purge runs.
+
+Unit test: `test_scd2.py::test_key_rotation_re_encrypts_and_guards_the_nightly_load`
+
+## 9. Deletes, schema drift and safeguards
+
+- [ ] **Hard delete on an incremental object (B-25).** Hard-delete a test record (Data Loader "hard delete") and run the nightly job on its object's check night (or with `reconcile.every_days: 1`). Expected: a `reconcile` event with `hard_deletes = 1`, the record's current version `_is_hard_deleted`, gone from the view.
+- [ ] **Archival (D-23, Q13).** Delete a test record as an archival user: it arrives `_is_archived`. If it doesn't arrive at all, the archival users hard-delete: raise Q13.
+- [ ] **Decimal places (B-32).** Raise a test number field's decimal places: the next run widens the column, no value is rounded, `field_retyped` reports the precision.
+- [ ] **Missing object in PROD (B-23).** Not testable in UAT: confirm with the unit test, and in PROD watch the first nights' `object_planned` warnings.
+- [ ] **Seed guard (B-34).** In a fresh catalog with a backup table, run the nightly job before the seed: the object fails with "hasn't been seeded".
+- [ ] **Approvals (B-28).** Approve a pending field by pull request in `config/approvals/roojai.yml`: after deploying to UAT and PROD, both environments query it.
+
+Unit tests:
+- `test_tasks.py::test_incremental_objects_are_checked_for_hard_deletes_when_due`
+- `test_deletes_views_dq.py::test_hard_delete_check_of_an_incremental_object`
+- `test_scd2.py::test_numeric_type_changes_widen_or_fail_but_never_round`
+- `test_tasks.py::test_a_missing_object_fails_in_prod`
+- `test_tasks.py::test_a_first_load_never_runs_before_the_seed`
+- `test_tasks.py::test_preflight_applies_new_field_policies_and_approvals`

@@ -22,11 +22,14 @@ from .scd2 import (
     UncastableValues,
     column_types,
     ensure_table,
+    hash_sql,
     ntz_literal,
     scd2_table,
     table_exists,
+    table_properties,
+    tracked_columns,
 )
-from .transform import BANGKOK_OFFSET_HOURS, bangkok_now
+from .transform import BANGKOK_OFFSET_HOURS, bangkok_now, normalize_empty
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +85,11 @@ def to_first_versions(
     """Backup rows -> first versions: plaintext PII, typed, flagged, hashed, encrypted with the current key."""
     names = [f.name for f in fields]
     out = df.select(*[(F.col(mapping[n]) if n in mapping else F.lit(None)).alias(n) for n in names])
+    # As in the nightly load, where Bulk CSV can't tell null from an empty string: both become null (B-38).
+    out = normalize_empty(out, [n for n, t in out.dtypes if t == "string"])
     out = legacy_to_plaintext(out, obj, legacy)
+    # A legacy ciphertext of '' decrypts to '': null too.
+    out = normalize_empty(out, [n for n, t in out.dtypes if t == "string"])
 
     # Backup timestamps are TIMESTAMP_NTZ or TIMESTAMP holding Bangkok wall-clock time; under the job's UTC session
     # both cast to NTZ without shifting.
@@ -115,8 +122,6 @@ def to_first_versions(
         if "lastmodifiedbyid" in lower and archival_user_ids
         else F.lit(False)
     )
-    excluded = {c.lower() for c in obj.hash_exclude}
-    tracked = sorted((n for n in names if n.lower() not in excluded), key=str.lower)
     valid_from = F.col(lower[obj.watermark.lower()])
     latest = Window.partitionBy("Id").orderBy(valid_from.desc())
     out = (
@@ -130,10 +135,10 @@ def to_first_versions(
         .withColumn("_is_deleted", deleted & ~F.col("_is_archived"))
         .withColumn("_deleted_at", F.when(F.col("_is_deleted"), valid_from))
         .withColumn("_archived_at", F.when(F.col("_is_archived"), valid_from))
-        # The hash covers plaintext, as in the nightly load.
-        .withColumn("_row_hash", F.sha2(F.to_json(F.struct(*[F.col(c).cast("string") for c in tracked])), 256))
+        .withColumn("_is_hard_deleted", F.lit(False))
     )
-    out = encrypt_columns(out, obj, spec)
+    # Over the stored values (typed, PII encrypted), exactly as the nightly load hashes them (B-21, B-38).
+    out = encrypt_columns(out, obj, spec).withColumn("_row_hash", F.expr(hash_sql(tracked_columns(obj, names))))
     for k, v in meta.items():
         out = out.withColumn(k, v)
     return out
@@ -154,7 +159,11 @@ def seed(ctx, names: set[str]) -> None:
         try:
             fields = [FieldInfo(**f) for f in ops.read_run_plan(spark, catalog, ctx.run_id, obj.name)]
             types, created = ensure_table(
-                spark, table, column_types(obj, fields), HISTORY_META if obj.is_history else SCD2_META
+                spark,
+                table,
+                column_types(obj, fields),
+                HISTORY_META if obj.is_history else SCD2_META,
+                table_properties(obj),
             )
             if not created and not spark.table(table).isEmpty():
                 raise RuntimeError("target table is not empty; the seed only loads empty tables")
@@ -165,12 +174,13 @@ def seed(ctx, names: set[str]) -> None:
             versions = to_first_versions(
                 src, obj, fields, mapping, types, t.archival_user_ids, legacy, ctx.spec, t.pii.key_version, ctx.run_id
             ).localCheckpoint()
-            versions.write.format("delta").mode("append").saveAsTable(table.replace("`", ""))
-            # Everything stored is encrypted with the current key: nothing to re-encrypt later.
+            # Everything stored is encrypted with the current key: nothing to re-encrypt later. Recorded before the
+            # append, so a failure in between can never lead the nightly load to encrypt the ciphertext again.
             done = ops.encryption_state(spark, catalog, obj.name)
             ops.record_encryption(
                 spark, catalog, obj.name, [k for k in pii_keys(obj) if k not in done], t.pii.key_version
             )
+            versions.write.format("delta").mode("append").saveAsTable(table.replace("`", ""))
 
             source_count, loaded = src.count(), spark.table(table).count()
             missing = sorted(f.name for f in fields if f.name not in mapping)

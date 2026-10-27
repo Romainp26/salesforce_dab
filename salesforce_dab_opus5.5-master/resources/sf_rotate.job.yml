@@ -1,0 +1,61 @@
+# On-demand PII key rotation (B-27, runbook §5.12): re-encrypts every PII value from the keys in pii.previous_keys
+# to pii.key_version, then starts the purge of the old ciphertext from the tables' history. Run it with the nightly schedule
+# paused, right after deploying the new key: until it has run, the nightly load refuses objects still on an old key.
+resources:
+  jobs:
+    sf_rotate_roojai:
+      name: sf-rotate-roojai_th_${bundle.target}
+      max_concurrent_runs: 1
+      email_notifications:
+        on_failure:
+          - ${var.alert_email}
+      # Operators run and repair the job; it runs as the service principal (runbook §6, B-29).
+      permissions:
+        - group_name: sf_operators_roojai_th_${bundle.target}
+          level: CAN_MANAGE_RUN
+      # A job parameter also makes the Jobs API refuse task-level argument overrides on run-now and repair.
+      parameters:
+        - name: objects
+          # Comma-separated objects, to rerun those that failed; empty rotates every object with encrypted values.
+          default: ""
+      job_clusters:
+        - job_cluster_key: sf
+          new_cluster: ${var.sf_cluster}
+      tasks:
+        # Recreates decrypt_pii with the new key, and decrypt_pii_at with every key.
+        - task_key: preflight
+          timeout_seconds: 3600
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [preflight, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}"]
+          libraries:
+            - whl: ../dist/*.whl
+
+        - task_key: rotate
+          depends_on:
+            - task_key: preflight
+          timeout_seconds: ${var.long_task_timeout_seconds}
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [rotate, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}",
+                         "--objects={{job.parameters.objects}}"]
+          libraries:
+            - whl: ../dist/*.whl
+
+        # The re-encrypted tables' history still holds the old key's ciphertext: REORG now, VACUUM and log cleanup
+        # in the nightly purges that follow (B-21).
+        - task_key: purge
+          depends_on:
+            - task_key: rotate
+          timeout_seconds: 3600
+          job_cluster_key: sf
+          python_wheel_task:
+            package_name: sf_ingest
+            entry_point: sf_ingest
+            parameters: [purge, --entity, roojai, --env, "${bundle.target}", --run-id, "{{job.run_id}}"]
+          libraries:
+            - whl: ../dist/*.whl

@@ -18,6 +18,8 @@ SKIP_TYPES = {"address", "location", "base64"}
 # Queried whenever Salesforce has them, whatever the allowlist says: delete and archival detection read them.
 SYSTEM_FIELDS = ("IsDeleted", "LastModifiedById")
 _SYSTEM_LOWER = {f.lower() for f in SYSTEM_FIELDS}
+# Types whose precision and scale decide the column type: a change to either is a retype (B-32).
+_NUMERIC_TYPES = {"double", "currency", "percent"}
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,10 @@ class FieldInfo:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def describe_type(self) -> str:
+        """`currency(18,2)` for numbers, the plain type otherwise: what a retype compares."""
+        return f"{self.sf_type}({self.precision},{self.scale})" if self.sf_type in _NUMERIC_TYPES else self.sf_type
 
 
 @dataclass
@@ -87,13 +93,22 @@ def plan_fields(
     obj: ObjectConfig,
     described: list[FieldInfo],
     allowlist: dict[str, int],
-    previous: dict[str, str] | None,
+    previous: dict[str, FieldInfo | str] | None,
 ) -> FieldPlan:
     """Decide which fields to query tonight.
 
     `allowlist` maps lower-cased field name to `allowed` (1 or 0); `previous` maps lower-cased field name
-    to the describe type stored on the last run, or is None on the first run.
+    to the describe output stored on the last run (a FieldInfo, or just its type), or is None on the first run.
     """
+    by_name = {f.name.lower() for f in described}
+    cond = obj.conditional_encryption.columns if obj.conditional_encryption else ()
+    if missing_pii := [c for c in (*obj.encrypted_fields, *cond) if c.lower() not in by_name]:
+        # A PII name that matches no field encrypts nothing: a typo, or a field Salesforce hides, would otherwise
+        # store the real column in plaintext or lose it silently (B-26).
+        raise ValueError(
+            f"{obj.name}: PII fields {missing_pii} are not in Salesforce's describe "
+            "(misspelled, not deployed, or hidden from the integration user)"
+        )
     plan = FieldPlan()
     for f in described:
         if f.sf_type in SKIP_TYPES:
@@ -114,13 +129,22 @@ def plan_fields(
         if required.lower() not in queried:
             raise ValueError(f"{obj.name}: {required} must be described and allowlisted")
 
+    now = {f.name.lower(): f for f in described}
+    allowed_names = {k for k, v in allowlist.items() if v == 1}
+    # An allowed field Salesforce doesn't describe is reported on the first run too (not deployed in this org, or
+    # hidden by field-level security), then whenever it disappears (B-32).
+    # Every night until it is described again or excluded (B-32): a field hidden by field-level security looks the same.
+    plan.removed = sorted(k for k in allowed_names if k not in now)
     if previous is not None:
-        now = {f.name.lower(): f for f in described}
-        allowed_names = {k for k, v in allowlist.items() if v == 1}
-        plan.removed = sorted(k for k in previous if k not in now and k in allowed_names)
-        plan.retyped = sorted(
-            (now[k].name, previous[k], now[k].sf_type)
-            for k in previous
-            if k in now and k in allowed_names and previous[k] != now[k].sf_type
-        )
+        for k, before in previous.items():
+            if k in now and k in allowed_names:
+                # A snapshot without precision and scale (an older run) compares types only.
+                old, new = (
+                    (before, now[k].sf_type)
+                    if isinstance(before, str)
+                    else (before.describe_type(), now[k].describe_type())
+                )
+                if old != new:
+                    plan.retyped.append((now[k].name, old, new))
+        plan.retyped.sort()
     return plan

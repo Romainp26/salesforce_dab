@@ -365,7 +365,7 @@ def pending_purges(spark: SparkSession, catalog: str) -> dict[str, dict]:
                 cur = out[r.object] = {"state": "requested", "version": r.version, "reasons": [], "files": []}
             if r.files:
                 cur["files"] = sorted(set(cur["files"]) | set(json.loads(r.files)))
-            elif cur["state"] != "requested":
+            if cur["state"] != "requested":
                 # A rewrite after the REORG needs another one, from its own version; files recorded so far stay.
                 cur.update(state="requested", version=r.version)
             elif r.version is not None and (cur["version"] is None or r.version < cur["version"]):

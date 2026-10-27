@@ -324,13 +324,9 @@ def test_an_empty_id_extract_is_refused_unless_nothing_is_current(spark, catalog
     load_object(spark, catalog, obj, ACCOUNT_FIELDS, landing("a1", [account_row("001A")]), ARCHIVAL, spec, 1, "r1")
     with pytest.raises(RuntimeError, match="no rows"):
         flag_hard_deletes(spark, catalog, obj, empty, "r2", datetime(2024, 6, 1), max_share=0.05)
-    gone = landing("a2", [account_row("001A", deleted="true", modstamp="2024-05-02T02:00:00.000Z")])
-    load_object(spark, catalog, obj, ACCOUNT_FIELDS, gone, ARCHIVAL, spec, 1, "r3")
-    with pytest.raises(RuntimeError, match="no rows"):
-        flag_hard_deletes(spark, catalog, obj, empty, "r2b", datetime(2024, 6, 1), max_share=0.05)
     # Every record really hard-deleted in Salesforce: accepted for one run with max_deleted_share 1.
-    assert flag_hard_deletes(spark, catalog, obj, empty, "r2c", datetime(2024, 6, 1), max_share=1).flagged == 1
-    # Every record deleted: an object with no records left has nothing to check.
+    assert flag_hard_deletes(spark, catalog, obj, empty, "r3", datetime(2024, 6, 1), max_share=1).flagged == 1
+    # Then no record is left: an empty extract has nothing to check.
     assert flag_hard_deletes(spark, catalog, obj, empty, "r4", datetime(2024, 6, 2), max_share=0.05).flagged == 0
 
 

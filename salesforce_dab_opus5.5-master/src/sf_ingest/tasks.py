@@ -30,7 +30,16 @@ from .deletes import HardDeletes, flag_hard_deletes
 from .encrypt import CipherSpec, condition_fields, pin_base64_format
 from .extract import ExtractOutcome, extract_object, landing_dir, landing_root
 from .metadata import FieldInfo, describe_all, is_missing_object, plan_fields
-from .scd2 import LoadStats, backfill_current, load_object, prepare_existing, rotate_key, scd2_table, table_exists
+from .scd2 import (
+    LoadStats,
+    backfill_current,
+    data_files,
+    load_object,
+    prepare_existing,
+    rotate_key,
+    scd2_table,
+    table_exists,
+)
 from .transform import bangkok_now, bangkok_time
 from .views import refresh_views
 
@@ -738,15 +747,14 @@ def ingest(
         if env in obj.paused:
             if obj.name not in requested:
                 log.info("%s: paused in %s (config/objects); skipped", obj.name, env)
-                error = apply_pii_config(ctx, obj)
+                # A failure keeps its failed load event as the latest, so run_log shows it.
+                if error := apply_pii_config(ctx, obj):
+                    results.append(ObjectResult(obj.name, "failed", error=error))
+                    continue
                 ops.append_event(
                     ctx.spark, ctx.catalog, ctx.run_id, obj.name, "ingest", "skipped", error_message=f"paused in {env}"
                 )
-                results.append(
-                    ObjectResult(obj.name, "failed", error=error)
-                    if error
-                    else ObjectResult(obj.name, "skipped", error=f"paused in {env}")
-                )
+                results.append(ObjectResult(obj.name, "skipped", error=f"paused in {env}"))
                 continue
             log.warning("%s: paused in %s but requested in `objects`; running it", obj.name, env)
         if obj.name not in planned:
@@ -925,7 +933,7 @@ def residue_files(spark, table: str, version: int | None) -> set[str]:
     return old - {_file_name(p) for p in spark.table(table).inputFiles()}
 
 
-def purge_object(ctx: Context, obj: ObjectConfig, pending: dict) -> list[dict]:
+def purge_object(ctx: Context, obj: ObjectConfig, pending: dict, read_at: datetime | None = None) -> list[dict]:
     """Remove the history an in-place PII rewrite left behind (B-21), over three or more nights:
 
     1. `requested`: REORG ... APPLY (PURGE) rewrites the files whose rows a deletion vector only masks. The data
@@ -938,21 +946,24 @@ def purge_object(ctx: Context, obj: ObjectConfig, pending: dict) -> list[dict]:
        after the purge; then the default retentions come back.
 
     Copies outside the table (storage soft delete, clones, backups) are outside Delta's reach (runbook §5.15).
+    `read_at`: when `pending` was read; every step records it, so a request another job made since stays pending.
     """
     spark, table = ctx.spark, scd2_table(ctx.catalog, obj)
+    read_at = read_at or datetime.now()
     if not table_exists(spark, table):
-        ops.record_purge(spark, ctx.catalog, obj.name, "done", None, ctx.run_id)
+        ops.record_purge(spark, ctx.catalog, obj.name, "done", None, ctx.run_id, read_at)
         return []
     if pending["state"] == "requested":
-        started = datetime.now()
         before = pending["version"]
         log.info("%s: purging the history before version %s (%s)", obj.name, before, "; ".join(pending["reasons"]))
         spark.sql(f"REORG TABLE {table} APPLY (PURGE)")
-        files = sorted(residue_files(spark, table, before) | set(pending.get("files", ())))
+        # The files recorded at the request (before the rewrite) or found by time travel, that the table no longer uses.
+        residue = set(pending.get("files", ())) | residue_files(spark, table, before)
+        files = sorted(residue - set(data_files(spark, table)))
         props = ", ".join(f"'{k}' = '{v}'" for k, v in purge_properties().items())
         spark.sql(f"ALTER TABLE {table} SET TBLPROPERTIES ({props})")
         version = _table_version(spark, table)
-        ops.record_purge(spark, ctx.catalog, obj.name, "reorged", version, ctx.run_id, started, files)
+        ops.record_purge(spark, ctx.catalog, obj.name, "reorged", version, ctx.run_id, read_at, files)
         log.info("%s: %d files to delete at the next purge, 12 hours from now at least", obj.name, len(files))
         return []
     if pending["state"] == "reorged":
@@ -963,7 +974,9 @@ def purge_object(ctx: Context, obj: ObjectConfig, pending: dict) -> list[dict]:
         remaining = {_file_name(r[0]) for r in spark.sql(f"VACUUM {table} DRY RUN").collect()}
         left = sorted(set(pending.get("files", ())) & remaining)
         if not left:
-            ops.record_purge(spark, ctx.catalog, obj.name, "files_purged", _table_version(spark, table), ctx.run_id)
+            ops.record_purge(
+                spark, ctx.catalog, obj.name, "files_purged", _table_version(spark, table), ctx.run_id, read_at
+            )
         recorded = len(pending.get("files", ()))
         detail = f"{len(left)} of {recorded} files of the old versions still in storage"
         return [dq.result("pii_history_purged", obj.name, dq.CRITICAL, not left, detail)]
@@ -975,7 +988,7 @@ def purge_object(ctx: Context, obj: ObjectConfig, pending: dict) -> list[dict]:
             f"ALTER TABLE {table} UNSET TBLPROPERTIES IF EXISTS "
             f"({', '.join(repr(k) for k in [*purge_properties(), 'sf_ingest.purge_check'])})"
         )
-        ops.record_purge(spark, ctx.catalog, obj.name, "done", earliest, ctx.run_id)
+        ops.record_purge(spark, ctx.catalog, obj.name, "done", earliest, ctx.run_id, read_at)
         return [dq.result("pii_log_purged", obj.name, dq.WARNING, True, f"log starts at version {earliest}")]
     late = datetime.now() - pending["at"] > PURGE_LOG_WARNING
     detail = f"log still starts at version {earliest}, before the purge at {pending['version']}"
@@ -984,6 +997,7 @@ def purge_object(ctx: Context, obj: ObjectConfig, pending: dict) -> list[dict]:
 
 def purge(ctx: Context) -> None:
     """Every pending purge (B-21). Fails the job when files of an old version stay in storage."""
+    read_at = datetime.now()
     pending = ops.pending_purges(ctx.spark, ctx.catalog)
     by_name = {o.name: o for o in ctx.settings.objects}
     results, failed = [], []
@@ -991,7 +1005,7 @@ def purge(ctx: Context) -> None:
         # An object removed from the config since its rewrite is still purged, by its table name.
         obj = by_name.get(name) or ObjectConfig(name=name)
         try:
-            results += purge_object(ctx, obj, state)
+            results += purge_object(ctx, obj, state, read_at)
         except Exception as exc:
             log.exception("%s: purge failed", name)
             results.append(dq.result("pii_history_purged", name, dq.CRITICAL, False, f"{type(exc).__name__}: {exc}"))
@@ -1013,9 +1027,15 @@ def rotate(ctx: Context, requested: set[str] = frozenset()) -> None:
     if not previous:
         raise SystemExit("rotate: pii.previous_keys lists no key to rotate from")
     failed = []
-    for obj in ctx.settings.objects:
-        if requested and obj.name not in requested:
+    by_name = {o.name: o for o in ctx.settings.objects}
+    recorded = {
+        r.object for r in ctx.spark.table(ops.ops_table(ctx.catalog, "encryption_state")).select("object").collect()
+    }
+    for name in sorted(set(by_name) | recorded):
+        if requested and name not in requested:
             continue
+        # An object removed from the config keeps its table and its old key's ciphertext: rotated by its table name.
+        obj = by_name.get(name) or ObjectConfig(name=name)
         table = scd2_table(ctx.catalog, obj)
         # Every object with encrypted values, as recorded, even one whose PII config was emptied since.
         if not table_exists(ctx.spark, table) or not ops.encryption_state(ctx.spark, ctx.catalog, obj.name):

@@ -16,7 +16,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from .config import ObjectConfig
-from .scd2 import merge_versions, ntz_literal, scd2_table, table_exists
+from .scd2 import SCD2_META, ensure_table, merge_versions, ntz_literal, scd2_table, table_exists
 
 log = logging.getLogger(__name__)
 
@@ -53,8 +53,9 @@ def flag_hard_deletes(
     """Close the current version of every record absent from the extract and add a hard-deleted version.
 
     Callers must only pass a complete, successful extract: an empty or partial one would flag everything. An empty
-    one is refused here unless the table has no current record either; with `max_share`, so is one that would flag
-    more than that share of the current records (and more than SHARE_GUARD_FLOOR).
+    one is refused here unless the table has no current record either, or `max_share` is 1 (every record really
+    deleted); with `max_share`, so is one that would flag more than that share of the current records (and more than
+    SHARE_GUARD_FLOOR).
     An object's `soql_filter` excludes records from the extract, so it applies to the current records too (it must
     then read as Spark SQL, as `Id != '...'` does); when it doesn't, the check is skipped.
     With `restore`, a record flagged earlier that is back in the extract becomes current again (the full-load path
@@ -64,6 +65,8 @@ def flag_hard_deletes(
     out = HardDeletes()
     if not table_exists(spark, table):
         return out
+    # A table created before B-25 lacks _is_hard_deleted, and a night with nothing extracted never adds it.
+    ensure_table(spark, table, [], SCD2_META)
     now = F.expr(ntz_literal(now_bangkok))
     current = spark.table(table).where("_is_current")
     if obj.soql_filter:
@@ -79,9 +82,17 @@ def flag_hard_deletes(
     )
     landed_ids = _landed_ids(spark, path)
     if landed_ids is None:
-        if not alive.isEmpty():
-            raise RuntimeError(f"{obj.name}: the Id extract has no rows; refusing to flag hard deletes")
-        return out
+        if alive.isEmpty():
+            return out
+        if max_share is None or max_share < 1:
+            what = "full extract" if max_share is None else "Id extract"
+            hint = (
+                ""
+                if max_share is None
+                else " (if every record was really deleted, set reconcile.max_deleted_share: 1 for one run)"
+            )
+            raise RuntimeError(f"{obj.name}: the {what} has no rows; refusing to flag hard deletes{hint}")
+        landed_ids = spark.createDataFrame([], "Id STRING")
     missing = (
         alive.join(landed_ids, "Id", "left_anti")
         .withColumn("_valid_from", now)

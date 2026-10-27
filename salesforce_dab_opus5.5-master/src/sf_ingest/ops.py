@@ -300,9 +300,26 @@ def record_encryption(
     append_rows(spark, catalog, "encryption_state", rows)
 
 
-def request_purge(spark: SparkSession, catalog: str, obj: str, reason: str, version: int, run_id: str) -> None:
-    """Ask the purge task to remove the history an in-place PII rewrite left behind (B-21)."""
-    row = dict(object=obj, action="requested", reason=reason, version=version, run_id=run_id, event_at=now_utc())
+def request_purge(
+    spark: SparkSession,
+    catalog: str,
+    obj: str,
+    reason: str,
+    version: int,
+    run_id: str,
+    files: list[str] | None = None,
+) -> None:
+    """Ask the purge task to remove the history an in-place PII rewrite left behind (B-21). `files`: the table's data
+    files before the rewrite, so the purge knows them without time travel, which may be refused by then."""
+    row = dict(
+        object=obj,
+        action="requested",
+        reason=reason,
+        version=version,
+        run_id=run_id,
+        event_at=now_utc(),
+        files=json.dumps(files) if files is not None else None,
+    )
     append_rows(spark, catalog, "pii_purge", [row])
 
 
@@ -316,7 +333,8 @@ def record_purge(
     started_at: datetime | None = None,
     files: list[str] | None = None,
 ) -> None:
-    """`started_at`: when the purge started, so a request made while it ran stays pending."""
+    """`started_at`: when the purge read the state it acted on, so a request or step another job recorded since
+    stays pending."""
     row = dict(
         object=obj,
         action=action,
@@ -337,17 +355,23 @@ def pending_purges(spark: SparkSession, catalog: str) -> dict[str, dict]:
     rows = spark.table(ops_table(catalog, "pii_purge")).collect()
     for r in sorted(rows, key=lambda r: r.event_at):
         cur = out.get(r.object)
+        # A step decided on a state read before another job's request or REORG doesn't cover it.
+        stale = r.started_at is not None and cur is not None and cur.get("at") is not None and cur["at"] > r.started_at
         if r.action == "done":
-            out.pop(r.object, None)
+            if not stale:
+                out.pop(r.object, None)
         elif r.action == "requested":
             if cur is None:
                 cur = out[r.object] = {"state": "requested", "version": r.version, "reasons": [], "files": []}
+            if r.files:
+                cur["files"] = sorted(set(cur["files"]) | set(json.loads(r.files)))
             elif cur["state"] != "requested":
                 # A rewrite after the REORG needs another one, from its own version; files recorded so far stay.
                 cur.update(state="requested", version=r.version)
             elif r.version is not None and (cur["version"] is None or r.version < cur["version"]):
                 cur["version"] = r.version
-            cur["reasons"].append(r.reason)
+            if r.reason not in cur["reasons"]:
+                cur["reasons"].append(r.reason)
             cur["requested_at"] = cur["at"] = r.event_at
         elif r.action == "reorged" and cur is not None:
             # A request made while the REORG ran (a backfill alongside) isn't covered by it: stays requested.
@@ -355,7 +379,7 @@ def pending_purges(spark: SparkSession, catalog: str) -> dict[str, dict]:
                 cur.update(state="reorged", version=r.version, files=json.loads(r.files or "[]"), at=r.event_at)
             else:
                 cur["files"] = sorted(set(cur["files"]) | set(json.loads(r.files or "[]")))
-        elif r.action == "files_purged" and cur is not None and cur["state"] == "reorged":
+        elif r.action == "files_purged" and cur is not None and cur["state"] == "reorged" and not stale:
             cur.update(state="files_purged", version=r.version, files=[], at=r.event_at)
     return out
 

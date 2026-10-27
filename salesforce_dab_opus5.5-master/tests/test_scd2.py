@@ -328,6 +328,7 @@ def test_decrypt_at_reads_each_row_with_its_key_version(spark, spec):
 
 
 IV_B64_2 = "BBBBBBBBBBBBBBBBBBBBBA=="
+KEY_B64_3 = "C" * 43 + "="
 
 
 HISTORY_FIELDS = [
@@ -432,3 +433,34 @@ def test_history_fields_match_case_insensitively(spark, catalog, spec, landing):
     load(spark, catalog, spec, landing("h1", rows, header), obj=obj, fields=HISTORY_FIELDS)
     got = spark.table(scd2_table(catalog, obj)).first()
     assert (got.OldValue, got.NewValue) == (reference_ciphertext("a@x.com"), reference_ciphertext("b@x.com"))
+
+
+def test_the_nightly_load_encrypts_history_rows_recorded_under_an_alias(spark, catalog, spec, landing):
+    """AccountHistory records a Name change as TextName: the load encrypts it as Name (B-21)."""
+    obj = ObjectConfig(name="AccountHistory", watermark="CreatedDate", history_encryption=("Name",))
+    header = [f.name for f in HISTORY_FIELDS]
+    rows = [
+        ["017A", "001A", "TextName", "Text", "Somchai", "Somsak", "false", "2024-05-01T00:00:00.000Z"],
+        ["017B", "001A", "Rating", "Text", "Hot", "Cold", "false", "2024-05-01T00:00:00.000Z"],
+    ]
+    load(spark, catalog, spec, landing("h1", rows, header), obj=obj, fields=HISTORY_FIELDS)
+    got = {r.Id: r for r in versions(spark, catalog, obj)}
+    assert got["017A"].OldValue == reference_ciphertext("Somchai")
+    assert got["017B"].OldValue == "Hot"
+
+
+def test_rotation_restamps_old_versions_that_hold_no_ciphertext(spark, catalog, spec, landing):
+    """B-27: rows stamped with a key no longer listed, but with no ciphertext, don't block the rotation."""
+    obj = account_config(conditional_encryption=None)
+    load(spark, catalog, spec, landing("p1", [account_row("001A", phone="")]), obj=obj)
+    table = scd2_table(catalog, obj)
+    new_key = CipherSpec.from_values("'" + "A" * 43 + "='", f"'{IV_B64_2}'", PII)
+    assert rotate_key(spark, catalog, obj, table, {}, new_key, 2, "r2") == 0
+    assert {r._pii_key_version for r in spark.table(table).collect()} == {2}
+
+    load(spark, catalog, new_key, landing("p2", [account_row("001B")]), obj=obj, run_id="r3", key_version=2)
+    spark.sql(f"UPDATE {table} SET _pii_key_version = 1 WHERE Id = '001B'")  # ciphertext under an unlisted key
+    with pytest.raises(RuntimeError, match=r"key versions \[1\]"):
+        rotate_key(
+            spark, catalog, obj, table, {}, CipherSpec.from_values(f"'{KEY_B64_3}'", f"'{IV_B64_2}'", PII), 3, "r4"
+        )

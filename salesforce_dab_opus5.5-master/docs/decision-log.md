@@ -302,7 +302,7 @@ Follows the audit of 2026-10-26 ([audit-2026-10-26.md](audit-2026-10-26.md), F-0
 **Decision:** Every `reconcile.every_days` (7) nights, each incremental, non-History object gets an Id-only `queryAll` extract after its load. It includes the recycle bin, so a missing Id was hard-deleted or purged.
 - Current records missing from it get a version flagged `_is_deleted` and `_is_hard_deleted`, and every view hides them.
 - Flagged records that are back are restored.
-- A check that would flag more than `reconcile.max_deleted_share` (5 %) of the current records fails the object instead.
+- A check that would flag more than `reconcile.max_deleted_share` (5 %) of the current records, and more than 10 records (`deletes.SHARE_GUARD_FLOOR`), fails the object instead. An empty Id extract fails it too while the table has current records, unless `max_deleted_share` is 1.
 - Each object's first check falls on a night set by a hash of its name, so the checks spread over the week.
 
 This supersedes D-18's "not checked for" (audit F-05). Full-load objects keep their nightly check, now also setting `_is_hard_deleted`.
@@ -322,11 +322,11 @@ This supersedes D-18's "not checked for" (audit F-05). Full-load objects keep th
 **Revisit when:** never.
 
 ## B-27: PII key rotation (2026-10-27)
-**Decision:** A new key gets a new `pii.key_version` and new secret names; the old ones move to `pii.previous_keys`. The on-demand job `sf_rotate_<entity>` re-encrypts every PII value of every table from each older version to the current one. It updates `_pii_key_version` and the row hash in the same statement, records the new version in `encryption_state` and queues a purge. Until it has run, the nightly load refuses every object whose state still names an older key. This answers Q7.
+**Decision:** A new key gets a new `pii.key_version` and new secret names; the old ones move to `pii.previous_keys`. The on-demand job `sf_rotate_<entity>` re-encrypts every PII value of every table from each older version to the current one. It updates `_pii_key_version` and the row hash in the same statement, records the new version in `encryption_state` and queues a purge. Until it has run, the nightly load refuses every object whose state still names an older key. Rows stamped with a key version no longer in `previous_keys` but holding no ciphertext (written before the object had PII) are restamped, not refused. Objects removed from the config are rotated too, by their table name. This answers Q7.
 
 **Alternatives:** the runbook's hand-written UPDATE, which left the old key's ciphertext in the history and the hashes stale.
 
-Consumers decrypt during a rotation with `ops_salesforce.decrypt_pii_at(value, _pii_key_version)`, which picks the key of the row's version; `decrypt_pii` knows only the current key.
+Consumers decrypt during a rotation with `ops_salesforce.decrypt_pii_at(value, _pii_key_version)` over the SCD2 tables (the views don't carry `_pii_key_version`), which picks the key of the row's version; `decrypt_pii` knows only the current key.
 
 **Revisit when:** never.
 

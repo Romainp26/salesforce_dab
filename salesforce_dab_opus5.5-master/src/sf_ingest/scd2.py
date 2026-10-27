@@ -19,6 +19,9 @@ from .encrypt import (
     decrypt_change,
     encrypt_change,
     encrypt_columns,
+    has_history_values,
+    history_match_sql,
+    is_ciphertext_sql,
     key_column,
     key_target,
     pii_keys,
@@ -106,12 +109,19 @@ def table_properties(obj: ObjectConfig) -> dict[str, str]:
 
 
 def _properties_sql(props: dict[str, str]) -> str:
-    return ", ".join(f"'{k}' = '{v}'" for k, v in props.items())
+    return ", ".join(f"{ops.sql_string(k)} = {ops.sql_string(v)}" for k, v in props.items())
 
 
 # Properties a rewrite doesn't carry over: they follow from the statement itself (features, protocol, clustering
-# columns) or are kept by Delta (row tracking's internal columns, the last commit's version and time).
+# columns), are kept by Delta or Unity Catalog, which refuse to have them set (row tracking's internal columns,
+# in-commit timestamps, catalog-owned commits, the table id), or aren't properties at all (constraints).
 _DERIVED_PROPERTIES = (
+    "delta.coordinatedCommits.",
+    "io.unitycatalog.",
+    "delta.enableInCommitTimestamps",
+    "delta.inCommitTimestamp",
+    "delta.constraints.",
+    "delta.columnMapping.maxColumnId",
     "delta.feature.",
     "delta.minReaderVersion",
     "delta.minWriterVersion",
@@ -124,6 +134,11 @@ _DERIVED_PROPERTIES = (
 
 def _carried_properties(props: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in props.items() if not k.startswith(_DERIVED_PROPERTIES)}
+
+
+def data_files(spark: SparkSession, table: str) -> list[str]:
+    """The data files of the table's current version, by name (what a purge must delete once rewritten, B-21)."""
+    return sorted({p.rstrip("/").rsplit("/", 1)[-1] for p in spark.table(table).inputFiles()})
 
 
 def _table_comment(spark: SparkSession, table: str) -> str | None:
@@ -447,7 +462,10 @@ def apply_pii_policy(
     tracked = tracked_columns(obj, [n for n, _ in schema])
     wanted_types = {f.name.lower(): spark_type(f) for f in fields}
     planned = (["rehash"] if rehash else []) + [f"decrypt:{k}" for k in dropped] + [f"encrypt:{k}" for k in to_encrypt]
-    ops.request_purge(spark, catalog, obj.name, ", ".join(planned), start_version, run_id)
+    reason = ", ".join(planned)
+    # Before the rewrite, with its files, so a crash after it can't lose the purge; again after it (below), so a
+    # purge that started while it ran doesn't count as covering it.
+    ops.request_purge(spark, catalog, obj.name, reason, start_version, run_id, data_files(spark, table))
     done: list[str] = []
 
     def run(change: str, key: str, statement_for) -> None:
@@ -519,6 +537,7 @@ def apply_pii_policy(
             run("encrypt", key, statement(changes, where, retype))
         ops.record_encryption(spark, catalog, obj.name, [key], key_version, "encrypted", run_id)
         done.append(f"encrypt:{key}")
+    ops.request_purge(spark, catalog, obj.name, reason, start_version, run_id)
     return done
 
 
@@ -546,11 +565,25 @@ def rotate_key(
     tags, start_version = _history_tags(spark, table)
     versions = [r[0] for r in spark.table(table).select("_pii_key_version").distinct().collect() if r[0] is not None]
     todo = sorted(v for v in versions if v != key_version)
-    if missing := [v for v in todo if v not in previous]:
-        raise RuntimeError(f"{obj.name}: rows use key versions {missing}, which pii.previous_keys doesn't list")
+    unknown = [v for v in todo if v not in previous]
+    if unknown:
+        # Rows stamped with a key removed from previous_keys but holding no ciphertext (written before the object
+        # had PII): restamp them, nothing to decrypt.
+        holds = _holds_ciphertext_sql(keys, columns)
+        if missing := [
+            v
+            for v in unknown
+            if not spark.sql(f"SELECT 1 FROM {table} WHERE _pii_key_version = {v} AND ({holds}) LIMIT 1").isEmpty()
+        ]:
+            raise RuntimeError(f"{obj.name}: rows use key versions {missing}, which pii.previous_keys doesn't list")
+        listed = ", ".join(str(v) for v in unknown)
+        log.info("%s: key versions %s hold no ciphertext; restamped %s", obj.name, listed, key_version)
+        spark.sql(f"UPDATE {table} SET _pii_key_version = {key_version} WHERE _pii_key_version IN ({listed})")
+        todo = [v for v in todo if v in previous]
+    reason = f"rotate to key version {key_version}"
     if todo:
         # Before the rewrite, so a crash after it can't lose the purge of the old key's ciphertext.
-        ops.request_purge(spark, catalog, obj.name, f"rotate to key version {key_version}", start_version, run_id)
+        ops.request_purge(spark, catalog, obj.name, reason, start_version, run_id, data_files(spark, table))
     rewritten = 0
     for version in todo:
         changes = rotate_change(keys, columns, previous[version], spec)
@@ -563,8 +596,24 @@ def rotate_key(
             log.info("%s: re-encrypting key version %s with version %s", obj.name, version, key_version)
             rows = _tagged(spark, tag, f"UPDATE {table} SET {', '.join(sets)} WHERE _pii_key_version = {version}")
             rewritten += int(rows[0]["num_affected_rows"]) if rows else 0
+    if todo:
+        # Again after it, so a purge that started while it ran doesn't count as covering it.
+        ops.request_purge(spark, catalog, obj.name, reason, start_version, run_id)
     ops.record_encryption(spark, catalog, obj.name, sorted(keys), key_version, "encrypted", run_id)
     return rewritten
+
+
+def _holds_ciphertext_sql(keys: set[str], columns: set[str]) -> str:
+    """Rows where a column the keys protect holds ciphertext."""
+    conds = []
+    for key in sorted(keys):
+        if key.startswith("history:"):
+            if has_history_values(columns):
+                values = " OR ".join(is_ciphertext_sql(c) for c in ("OldValue", "NewValue"))
+                conds.append(f"({history_match_sql([key.removeprefix('history:')])} AND ({values}))")
+        elif key_column(key) in columns:
+            conds.append(is_ciphertext_sql(quote(key_column(key))))
+    return " OR ".join(conds) or "false"
 
 
 def prepare_existing(

@@ -213,7 +213,8 @@ def encrypt_columns(df: DataFrame, obj: ObjectConfig, spec: CipherSpec) -> DataF
         df = df.drop(_COND_COL)
 
     if obj.history_encryption and has_history_values(set(present)):
-        match = F.lower(F.col(present["field"])).isin([f.lower() for f in obj.history_encryption])
+        # The same match as every in-place rewrite and the DQ check, aliases included (AccountHistory's TextName).
+        match = F.expr(history_match_sql(obj.history_encryption))
         for name in ("oldvalue", "newvalue"):
             col = present[name]
             df = df.withColumn(col, F.when(match, enc(col)).otherwise(F.col(col)))

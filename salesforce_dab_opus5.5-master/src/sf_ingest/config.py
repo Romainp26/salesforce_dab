@@ -181,7 +181,8 @@ class EntityEnv:
     pii: PiiSettings
     access: AccessGroups
     # Incremental objects are checked for hard deletes (an Id-only extract) every `reconcile_days` (0: never, B-25);
-    # a check that would flag more than `reconcile_max_deleted_share` of the current records fails instead.
+    # a check that would flag more than `reconcile_max_deleted_share` of the current records, and more than
+    # deletes.SHARE_GUARD_FLOOR, fails instead.
     reconcile_days: int = 7
     reconcile_max_deleted_share: float = 0.05
     # An object with no successful ingest for this long raises `object_freshness` (B-23).

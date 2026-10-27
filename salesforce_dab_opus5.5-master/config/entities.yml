@@ -16,7 +16,8 @@ freshness_hours: 36
 
 # Hard-delete check of incremental objects (B-25): every `every_days` days an Id-only queryAll extract is compared
 # with the current SCD2 records; missing ones get a hard-deleted version, hidden in the views. A check that would flag
-# more than `max_deleted_share` of the current records fails the object instead. every_days: 0 turns it off.
+# more than `max_deleted_share` of the current records, and more than 10, fails the object instead; 1 accepts an empty
+# extract (every record really deleted). every_days: 0 turns it off.
 reconcile:
   every_days: 7
   max_deleted_share: 0.05

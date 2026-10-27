@@ -29,7 +29,7 @@ Every setting the solution reads, where it lives and what it does. Config files 
 | `full_reload_split_from` | First year of the yearly `CreatedDate` ranges of a split full reload |
 | `freshness_hours` | Hours without a successful ingest before `object_freshness` warns (36, B-23) |
 | `reconcile.every_days` | Nights between hard-delete checks of an incremental object (7; 0 turns them off, B-25) |
-| `reconcile.max_deleted_share` | Share of current records a hard-delete check may flag before it fails instead (0.05) |
+| `reconcile.max_deleted_share` | Share of current records a hard-delete check may flag before it fails instead (0.05), once more than 10 records would be flagged. 1 accepts an empty Id extract (every record really deleted), for one run |
 | `access.readers`, `access.history_readers`, `access.operators`, `access.pii_readers` | Groups preflight grants to, `{catalog}` replaced: views; SCD2 tables; `ops_salesforce`; EXECUTE on `decrypt_pii` and `decrypt_pii_at` (B-29). Nobody gets write access to `field_allowlist` |
 | `pii.key_version` | Version written to `_pii_key_version` |
 | `pii.key_encoding`, `pii.iv_encoding` | How the key and IV secrets are stored: `base64` (current), `hex` or `utf8` |

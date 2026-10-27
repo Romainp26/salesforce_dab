@@ -326,6 +326,10 @@ def test_an_empty_id_extract_is_refused_unless_nothing_is_current(spark, catalog
         flag_hard_deletes(spark, catalog, obj, empty, "r2", datetime(2024, 6, 1), max_share=0.05)
     gone = landing("a2", [account_row("001A", deleted="true", modstamp="2024-05-02T02:00:00.000Z")])
     load_object(spark, catalog, obj, ACCOUNT_FIELDS, gone, ARCHIVAL, spec, 1, "r3")
+    with pytest.raises(RuntimeError, match="no rows"):
+        flag_hard_deletes(spark, catalog, obj, empty, "r2b", datetime(2024, 6, 1), max_share=0.05)
+    # Every record really hard-deleted in Salesforce: accepted for one run with max_deleted_share 1.
+    assert flag_hard_deletes(spark, catalog, obj, empty, "r2c", datetime(2024, 6, 1), max_share=1).flagged == 1
     # Every record deleted: an object with no records left has nothing to check.
     assert flag_hard_deletes(spark, catalog, obj, empty, "r4", datetime(2024, 6, 2), max_share=0.05).flagged == 0
 
@@ -352,3 +356,44 @@ def test_records_the_soql_filter_excludes_are_not_flagged_hard_deleted(spark, ca
     load_object(spark, catalog, obj, ACCOUNT_FIELDS, landing("a1", rows), ARCHIVAL, spec, 1, "r1")
     present = landing("ids", [["001B"]], ["Id"])
     assert flag_hard_deletes(spark, catalog, obj, present, "r2", datetime(2024, 6, 1), max_share=0.05).flagged == 0
+
+
+def test_a_purge_step_decided_before_another_jobs_request_does_not_cover_it(spark, catalog):
+    """B-21: a backfill requests a purge while the nightly purge, working from an earlier read, finishes one."""
+    t0 = datetime(2026, 11, 1, 0, 0)
+    rows = [
+        {"object": "Account", "action": "requested", "version": 3, "event_at": t0},
+        {
+            "object": "Account",
+            "action": "reorged",
+            "version": 4,
+            "event_at": t0 + timedelta(hours=1),
+            "started_at": t0 + timedelta(minutes=30),
+            "files": "[]",
+        },
+        {
+            "object": "Account",
+            "action": "files_purged",
+            "version": 5,
+            "event_at": t0 + timedelta(days=1),
+            "started_at": t0 + timedelta(days=1),
+        },
+        # The backfill's request, then the nightly purge's done from its read before it.
+        {
+            "object": "Account",
+            "action": "requested",
+            "version": 8,
+            "event_at": t0 + timedelta(days=2, minutes=10),
+            "files": '["c.parquet"]',
+        },
+        {
+            "object": "Account",
+            "action": "done",
+            "version": 9,
+            "event_at": t0 + timedelta(days=2, minutes=20),
+            "started_at": t0 + timedelta(days=2),
+        },
+    ]
+    ops.append_rows(spark, catalog, "pii_purge", rows)
+    pending = ops.pending_purges(spark, catalog)["Account"]
+    assert (pending["state"], pending["version"], pending["files"]) == ("requested", 8, ["c.parquet"])
